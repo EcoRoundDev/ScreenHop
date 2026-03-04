@@ -206,7 +206,7 @@ where
     Ok(())
 }
 
-/// macOS: 将解压目录中的 .app 替换当前运行的 .app，然后重新打开
+/// macOS: 将解压目录中的 .app 替换当前运行的 .app，这里使用后台脚本以确保原进程退出后执行，防止 TCC 权限丢失。
 #[cfg(target_os = "macos")]
 pub fn apply_update_macos(extract_dir: &std::path::Path) -> Result<()> {
     // 找到解压出的 .app
@@ -218,6 +218,13 @@ pub fn apply_update_macos(extract_dir: &std::path::Path) -> Result<()> {
 
     let new_app = app_entry.path();
     log::info!("找到新版应用: {:?}", new_app);
+
+    // 去除隔離屬性，否則 macOS 會報錯應用損壞且可能導致重新產生 TCC 問題
+    let _ = std::process::Command::new("xattr")
+        .arg("-rd")
+        .arg("com.apple.quarantine")
+        .arg(&new_app)
+        .status();
 
     // 定位当前运行的 .app bundle（从 binary 向上三级: binary -> MacOS -> Contents -> .app）
     let current_exe = std::env::current_exe().context("获取当前可执行文件路径失败")?;
@@ -236,25 +243,54 @@ pub fn apply_update_macos(extract_dir: &std::path::Path) -> Result<()> {
 
     log::info!("当前 .app 路径: {:?}", bundle_path);
 
-    // 用 ditto 替换（ditto 能正确处理 .app bundle，保留权限和结构）
-    let status = std::process::Command::new("ditto")
-        .arg(&new_app)
-        .arg(&bundle_path)
+    let current_pid = std::process::id();
+
+    // 创建更新脚本
+    // 我们必须在主进程退出后再进行替换，否则正在运行中的二进制被覆盖或修改，
+    // 会导致系统证书缓存/amfid失效，从而使得 TCC权限（如辅助功能）在下次启动时丢失。
+    let script_content = format!(
+        r#"#!/bin/bash
+# 等待主进程退出
+while kill -0 {pid} 2>/dev/null; do
+    sleep 0.1
+done
+
+# 删除旧应用并移动新应用
+rm -rf "{old_app}"
+mv "{new_app}" "{old_app}"
+
+# 重新启动新应用
+open -a "{old_app}"
+
+# 删除更新脚本自身
+rm "$0"
+"#,
+        pid = current_pid,
+        old_app = bundle_path.display(),
+        new_app = new_app.display()
+    );
+
+    let script_path = std::env::temp_dir().join(format!("screenhop_updater_{}.sh", current_pid));
+    std::fs::write(&script_path, script_content).context("写入更新脚本失败")?;
+
+    // 添加可执行权限
+    std::process::Command::new("chmod")
+        .arg("+x")
+        .arg(&script_path)
         .status()
-        .context("执行 ditto 失败")?;
+        .context("无法为更新脚本添加执行权限")?;
 
-    if !status.success() {
-        anyhow::bail!("ditto 替换 .app 失败，退出码: {:?}", status.code());
-    }
+    log::info!("准备执行后台更新脚本，即将退出当前进程...");
 
-    log::info!("替换完成，正在重新启动...");
-
-    // 用 open 重新启动 .app
-    std::process::Command::new("open")
-        .arg("-a")
-        .arg(&bundle_path)
+    // 启动后台脚本执行替换与重启（detached）
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "nohup \"{}\" >/dev/null 2>&1 &",
+            script_path.display()
+        ))
         .spawn()
-        .context("重新启动 .app 失败")?;
+        .context("启动后台更新脚本失败")?;
 
     Ok(())
 }

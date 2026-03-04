@@ -1,5 +1,5 @@
-use anyhow::Result;
 use crate::AutoStart;
+use anyhow::Result;
 
 /// macOS 开机自启动（基于 SMAppService / ServiceManagement）
 pub struct MacAutoStart;
@@ -16,7 +16,7 @@ impl AutoStart for MacAutoStart {
             use objc::*;
 
             if let Some(cls) = objc::runtime::Class::get("SMAppService") {
-                let service: *mut objc::runtime::Object = msg_send![cls, mainApp];
+                let service: *mut objc::runtime::Object = msg_send![cls, mainAppService];
                 if !service.is_null() {
                     let status: i64 = msg_send![service, status];
                     // SMAppServiceStatusEnabled = 1
@@ -33,7 +33,7 @@ impl AutoStart for MacAutoStart {
             use objc::*;
 
             if let Some(cls) = objc::runtime::Class::get("SMAppService") {
-                let service: *mut objc::runtime::Object = msg_send![cls, mainApp];
+                let service: *mut objc::runtime::Object = msg_send![cls, mainAppService];
                 if !service.is_null() {
                     if enabled {
                         let mut error: *mut objc::runtime::Object = std::ptr::null_mut();

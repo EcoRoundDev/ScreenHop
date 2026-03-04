@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="./assets/ScreenHopIconTray.svg" alt="ScreenHop Logo" width="128" />
+<img src="./assets/ScreenHopIcon-macOS.svg" alt="ScreenHop Logo" width="128" />
 
 # ScreenHop
 

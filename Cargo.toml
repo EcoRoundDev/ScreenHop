@@ -5,9 +5,9 @@ members = ["crates/core", "crates/platform", "crates/app"]
 [workspace.package]
 version = "1.0.6"
 edition = "2021"
-authors = ["dongdong"]
+authors = ["EcoRoundDev"]
 license = "MIT"
-repository = "https://github.com/dongdongGit/ScreenHop"
+repository = "https://github.com/EcoRoundDev/ScreenHop"
 
 [workspace.dependencies]
 # 共享依赖版本

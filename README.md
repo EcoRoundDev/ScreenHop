@@ -11,7 +11,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Windows-lightgrey.svg)](#-安装)
 
-[下载最新版本](https://github.com/dongdongGit/ScreenHop/releases/latest) • [问题反馈](https://github.com/dongdongGit/ScreenHop/issues) • [源码构建](#%EF%B8%8F-从源码构建)
+[下载最新版本](https://github.com/EcoRoundDev/ScreenHop/releases/latest) • [问题反馈](https://github.com/EcoRoundDev/ScreenHop/issues) • [源码构建](#%EF%B8%8F-从源码构建)
 
 ---
 
@@ -29,7 +29,7 @@
 
 ## 📥 安装
 
-前往 [GitHub Releases 页面](https://github.com/dongdongGit/ScreenHop/releases) 下载最新版本。
+前往 [GitHub Releases 页面](https://github.com/EcoRoundDev/ScreenHop/releases) 下载最新版本。
 
 ### 🍎 macOS 用户
 
@@ -67,7 +67,7 @@
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # 2. 克隆项目
-git clone https://github.com/dongdongGit/ScreenHop.git
+git clone https://github.com/EcoRoundDev/ScreenHop.git
 cd ScreenHop
 ```
 

@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use semver::Version;
 use serde::Deserialize;
 
-const GITHUB_API_URL: &str = "https://api.github.com/repos/dongdongGit/ScreenHop/releases/latest";
-const RELEASES_PAGE_URL: &str = "https://github.com/dongdongGit/ScreenHop/releases/latest";
+const GITHUB_API_URL: &str = "https://api.github.com/repos/EcoRoundDev/ScreenHop/releases/latest";
+const RELEASES_PAGE_URL: &str = "https://github.com/EcoRoundDev/ScreenHop/releases/latest";
 
 /// 更新检查结果
 #[derive(Debug, Clone)]

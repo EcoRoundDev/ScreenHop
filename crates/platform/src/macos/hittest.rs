@@ -41,9 +41,7 @@ impl MacHitTester {
             );
 
             if result == 0 && !role_ref.is_null() {
-                let role = core_foundation::string::CFString::wrap_under_create_rule(
-                    role_ref as _,
-                );
+                let role = core_foundation::string::CFString::wrap_under_create_rule(role_ref as _);
                 Some(role.to_string())
             } else {
                 None
@@ -86,7 +84,6 @@ impl MacHitTester {
         let mut current = start_element;
         let mut depth = 0;
         let max_depth = 10;
-        let mut found_interactive = false;
 
         loop {
             if depth >= max_depth {
@@ -110,11 +107,6 @@ impl MacHitTester {
                 return false;
             }
 
-            // 记录交互元素
-            if ["AXStaticText", "AXImage", "AXButton", "AXRadioButton"].contains(&role.as_str()) {
-                found_interactive = true;
-            }
-
             // 向上查找
             match self.get_parent(current) {
                 Some(parent) => {
@@ -125,7 +117,8 @@ impl MacHitTester {
             }
         }
 
-        found_interactive
+        // 没有找到 AXTabGroup 祖先，说明不在 Tab 区域内，允许移动
+        false
     }
 }
 

@@ -2,36 +2,23 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod app;
+mod single_instance;
 mod slint_ui;
 mod tray;
 
 use anyhow::{Context, Result};
 use screenhop::config::AppConfig;
-use std::net::TcpListener;
 
-#[allow(dead_code)]
 const APP_ID: &str = "com.dongdong.screenhop";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// 使用 TCP 端口锁实现单实例检测（避免 single-instance crate 在 .app 中的文件系统只读问题）
-fn try_lock_single_instance() -> bool {
-    // 绑定一个固定的本地端口；成功则说明当前是唯一实例
-    match TcpListener::bind("127.0.0.1:57832") {
-        Ok(listener) => {
-            // 把监听器泄露到堆上，让它在进程退出前一直持有端口
-            Box::leak(Box::new(listener));
-            true
-        }
-        Err(_) => false, // 端口被占用，说明已有实例在运行
-    }
-}
-
 fn inner_main() -> Result<()> {
     // 单实例检测
-    if !try_lock_single_instance() {
+    let Some(_instance_lock) = single_instance::try_lock(APP_ID).context("单实例检测失败")?
+    else {
         log::warn!("程序已在运行中，退出");
         return Ok(());
-    }
+    };
 
     // 加载配置
     let config = AppConfig::load().context("加载配置失败")?;

@@ -876,7 +876,7 @@ pub fn run_app(config: AppConfig) -> Result<()> {
     // 创建菜单
     let menu = Menu::new();
 
-    let status_item = MenuItem::new("Window Mover is Running", false, None);
+    let status_item = MenuItem::new("ScreenHop is Running", false, None);
     let toggle_item = MenuItem::with_id(
         MENU_ID_TOGGLE,
         if config.lock().unwrap().disable_hook {

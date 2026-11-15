@@ -52,6 +52,27 @@ pub struct AppConfig {
     /// 可填写本地 http server 地址或已发布版本的 zip 直链
     #[serde(default)]
     pub test_update_url: Option<String>,
+
+    /// 上次自动检查更新的 Unix 时间戳（秒）
+    #[serde(default)]
+    pub last_update_check_ts: Option<i64>,
+
+    /// 用户选择"跳过此版本"的版本号
+    #[serde(default)]
+    pub skip_update_version: Option<String>,
+
+    /// 界面主题
+    #[serde(default)]
+    pub theme: Theme,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Theme {
+    #[default]
+    Auto,
+    Light,
+    Dark,
 }
 
 fn default_true() -> bool {
@@ -76,6 +97,9 @@ impl Default for AppConfig {
             proxy_password: None,
             test_update_version: None,
             test_update_url: None,
+            last_update_check_ts: None,
+            skip_update_version: None,
+            theme: Theme::Auto,
         }
     }
 }
@@ -107,7 +131,14 @@ impl AppConfig {
         let content = fs::read_to_string(&path)
             .with_context(|| format!("无法读取配置文件: {}", path.display()))?;
 
-        let config: Self = toml::from_str(&content).with_context(|| "配置文件格式错误")?;
+        #[allow(unused_mut)]
+        let mut config: Self = toml::from_str(&content).with_context(|| "配置文件格式错误")?;
+
+        #[cfg(not(debug_assertions))]
+        {
+            config.test_update_version = None;
+            config.test_update_url = None;
+        }
 
         Ok(config)
     }
@@ -142,6 +173,9 @@ mod tests {
         assert!(config.proxy_url.is_empty());
         assert!(config.proxy_username.is_none());
         assert!(config.proxy_password.is_none());
+        assert_eq!(config.theme, Theme::Auto);
+        assert!(config.last_update_check_ts.is_none());
+        assert!(config.skip_update_version.is_none());
     }
 
     #[test]

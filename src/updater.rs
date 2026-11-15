@@ -15,7 +15,37 @@ pub struct UpdateCheckResult {
     pub download_url: Option<String>,
     pub asset_name: Option<String>,
     pub asset_size: u64,
-    pub error_message: Option<String>,
+    pub error: Option<UpdateError>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateErrorKind {
+    Network,
+    Http(u16),
+    Parse,
+    NoAsset,
+    Proxy,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateError {
+    pub kind: UpdateErrorKind,
+    pub message: String,
+}
+
+impl UpdateError {
+    fn new(kind: UpdateErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for UpdateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
 }
 
 /// GitHub Release API 响应结构
@@ -33,35 +63,38 @@ struct GithubAsset {
     size: u64,
 }
 
-/// 获取当前平台的资源关键字
-fn get_platform_keyword() -> &'static str {
+/// 获取当前平台的候选资源关键字（按优先级）
+fn get_platform_keywords() -> Vec<&'static str> {
     if cfg!(target_os = "windows") {
         match std::env::consts::ARCH {
-            "x86_64" => "win-x64",
-            "x86" => "win-x86",
-            "aarch64" => "win-arm64",
-            _ => "win-x64",
+            "x86_64" => vec!["win-x64"],
+            "x86" => vec!["win-x86"],
+            "aarch64" => vec!["win-arm64"],
+            _ => vec!["win-x64"],
         }
     } else if cfg!(target_os = "macos") {
         match std::env::consts::ARCH {
-            "aarch64" => "macOS-arm64",
-            "x86_64" => "macOS-x86_64",
-            _ => "macOS-universal",
+            "aarch64" => vec!["macOS-universal", "macOS-arm64"],
+            "x86_64" => vec!["macOS-universal", "macOS-x86_64"],
+            _ => vec!["macOS-universal"],
         }
     } else {
-        "unknown"
+        Vec::new()
     }
 }
 
 /// 从 assets 列表中找到匹配当前平台的下载链接
 fn find_matching_asset(assets: &[GithubAsset]) -> Option<&GithubAsset> {
-    let platform_key = get_platform_keyword();
-    log::debug!("查找匹配资源: platform={}", platform_key);
+    let keywords = get_platform_keywords();
+    log::debug!("查找匹配资源: {:?}", keywords);
 
-    // 精确匹配平台关键字
-    assets
-        .iter()
-        .find(|a| a.name.contains(platform_key) && a.name.ends_with(".zip"))
+    keywords.iter().find_map(|key| {
+        assets.iter().find(|asset| {
+            asset.name.starts_with("ScreenHop-")
+                && asset.name.contains(key)
+                && asset.name.ends_with(".zip")
+        })
+    })
 }
 
 /// 检查是否有新版本
@@ -130,7 +163,7 @@ async fn check_for_update_inner(
             asset_name: mock_download_url
                 .map(|u| u.split('/').last().unwrap_or("update.zip").to_string()),
             asset_size: 0,
-            error_message: None,
+            error: None,
         });
     }
 
@@ -142,7 +175,7 @@ async fn check_for_update_inner(
         download_url: None,
         asset_name: None,
         asset_size: 0,
-        error_message: None,
+        error: None,
     };
 
     let mut builder = reqwest::Client::builder()
@@ -150,27 +183,66 @@ async fn check_for_update_inner(
         .timeout(std::time::Duration::from_secs(15));
 
     if let Some(proxy) = proxy_url {
-        let mut proxy_obj = reqwest::Proxy::all(proxy).context("代理地址格式错误")?;
+        let mut proxy_obj = match reqwest::Proxy::all(proxy) {
+            Ok(proxy_obj) => proxy_obj,
+            Err(err) => {
+                result.error = Some(UpdateError::new(
+                    UpdateErrorKind::Proxy,
+                    format!("代理地址格式错误: {err}"),
+                ));
+                return Ok(result);
+            }
+        };
         if let (Some(user), Some(pass)) = (proxy_username, proxy_password) {
             proxy_obj = proxy_obj.basic_auth(user, pass);
         }
         builder = builder.proxy(proxy_obj);
     }
 
-    let client = builder.build().context("创建 HTTP 客户端失败")?;
+    let client = match builder.build() {
+        Ok(client) => client,
+        Err(err) => {
+            result.error = Some(UpdateError::new(
+                UpdateErrorKind::Network,
+                format!("创建 HTTP 客户端失败: {err}"),
+            ));
+            return Ok(result);
+        }
+    };
 
-    let response = client
-        .get(GITHUB_API_URL)
-        .send()
-        .await
-        .context("请求 GitHub API 失败")?;
+    let response = match client.get(GITHUB_API_URL).send().await {
+        Ok(response) => response,
+        Err(err) => {
+            result.error = Some(UpdateError::new(
+                UpdateErrorKind::Network,
+                format!("请求 GitHub API 失败: {err}"),
+            ));
+            return Ok(result);
+        }
+    };
 
-    if !response.status().is_success() {
-        result.error_message = Some(format!("GitHub API 返回 {}", response.status()));
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        let snippet: String = body.chars().take(200).collect();
+        log::warn!("GitHub API 返回 {}: {}", status, snippet);
+        result.error = Some(UpdateError::new(
+            UpdateErrorKind::Http(status.as_u16()),
+            format!("GitHub API 返回 {status}"),
+        ));
         return Ok(result);
     }
 
-    let release: GithubRelease = response.json().await.context("解析 GitHub API 响应失败")?;
+    let release: GithubRelease = match response.json().await {
+        Ok(release) => release,
+        Err(err) => {
+            result.error = Some(UpdateError::new(
+                UpdateErrorKind::Parse,
+                format!("解析 GitHub API 响应失败: {err}"),
+            ));
+            return Ok(result);
+        }
+    };
 
     let latest_str = release.tag_name.trim_start_matches('v');
     result.latest_version = latest_str.to_string();
@@ -186,10 +258,19 @@ async fn check_for_update_inner(
 
     // 查找匹配的下载资源
     if result.has_update {
-        if let Some(asset) = find_matching_asset(&release.assets) {
-            result.download_url = Some(asset.browser_download_url.clone());
-            result.asset_name = Some(asset.name.clone());
-            result.asset_size = asset.size;
+        match find_matching_asset(&release.assets) {
+            Some(asset) => {
+                result.download_url = Some(asset.browser_download_url.clone());
+                result.asset_name = Some(asset.name.clone());
+                result.asset_size = asset.size;
+            }
+            None => {
+                log::warn!("发行包缺少当前平台产物: {:?}", get_platform_keywords());
+                result.error = Some(UpdateError::new(
+                    UpdateErrorKind::NoAsset,
+                    "发行包缺少当前平台产物",
+                ));
+            }
         }
     }
 
@@ -486,13 +567,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_get_platform_keyword() {
-        let keyword = get_platform_keyword();
-        // 在 macOS 上应该返回 macOS 相关的关键字
+    fn test_platform_keywords() {
+        let keywords = get_platform_keywords();
+        assert!(!keywords.is_empty());
         #[cfg(target_os = "macos")]
-        assert!(keyword.starts_with("macOS"));
+        {
+            assert_eq!(keywords[0], "macOS-universal");
+            assert!(keywords.iter().all(|key| key.starts_with("macOS")));
+        }
         #[cfg(target_os = "windows")]
-        assert!(keyword.starts_with("win"));
+        {
+            assert!(keywords.iter().all(|key| key.starts_with("win-")));
+        }
+    }
+
+    fn asset(name: &str) -> GithubAsset {
+        GithubAsset {
+            name: name.to_string(),
+            browser_download_url: String::new(),
+            size: 0,
+        }
+    }
+
+    #[test]
+    fn test_find_matching_asset_requires_prefix_and_zip() {
+        let assets = vec![
+            asset("screenhop-win-x64-1.2.0.zip"),
+            asset("ScreenHop-win-x64-1.2.0.tar"),
+        ];
+        assert!(find_matching_asset(&assets).is_none());
+    }
+
+    #[test]
+    fn test_find_matching_asset_ignores_other_platform() {
+        #[cfg(target_os = "windows")]
+        {
+            let assets = vec![asset("ScreenHop-macOS-arm64-1.2.0.zip")];
+            assert!(find_matching_asset(&assets).is_none());
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let assets = vec![asset("ScreenHop-win-x64-1.2.0.zip")];
+            assert!(find_matching_asset(&assets).is_none());
+        }
     }
 
     /// 验证代理配置生效：向 OS 申请一个空闲端口后立即释放，确保该端口没有任何进程监听，
@@ -510,16 +627,13 @@ mod tests {
         println!("[测试] 使用动态关闭端口: {}", closed_port);
 
         let result = check_for_update("0.0.0", Some(&proxy_url), None, None).await;
-
-        assert!(
-            result.is_err(),
-            "使用无效代理时应该返回错误，实际结果: {:?}",
-            result
-        );
-        println!(
-            "[预期错误] 代理配置生效，错误信息: {:?}",
-            result.unwrap_err()
-        );
+        let info = result.expect("代理地址格式合法时应返回检查结果");
+        let err = info.error.expect("代理不可达时应产生错误");
+        assert!(matches!(
+            err.kind,
+            UpdateErrorKind::Network | UpdateErrorKind::Proxy | UpdateErrorKind::Http(_)
+        ));
+        println!("[预期错误] 代理配置生效，错误信息: {}", err.message);
     }
 
     /// 对照组：不使用代理时，在网络正常的情况下应能成功获取到版本信息

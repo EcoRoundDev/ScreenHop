@@ -1,17 +1,23 @@
 use anyhow::Result;
 use muda::{Menu, MenuItem, PredefinedMenuItem};
 use screenhop::config::AppConfig;
+use screenhop_platform::{AutoStart, AutoStartStatus, BlockReason};
 use slint::ComponentHandle;
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use tray_icon::{menu::MenuEvent, Icon, TrayIconBuilder};
 
 const MENU_ID_TOGGLE: &str = "toggle";
+const MENU_ID_SETTINGS: &str = "settings";
 const MENU_ID_AUTOSTART: &str = "autostart";
 const MENU_ID_CHECK_UPDATE: &str = "check_update";
 const MENU_ID_PROXY_ENABLE: &str = "proxy_enable";
 const MENU_ID_PROXY_SETTINGS: &str = "proxy_settings";
 const MENU_ID_AUTO_CHECK_UPDATE: &str = "auto_check_update";
 const MENU_ID_QUIT: &str = "quit";
+
+const REPO_URL: &str = "https://github.com/EcoRoundDev/ScreenHop";
 
 /// 创建托盘图标（使用真实的 png）
 fn create_tray_icon_image() -> Icon {
@@ -30,25 +36,121 @@ fn create_tray_icon_image() -> Icon {
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn should_auto_check(cfg: &AppConfig) -> bool {
+    if cfg.test_update_version.is_some() {
+        return true;
+    }
+    if !cfg.auto_check_update {
+        return false;
+    }
+    match cfg.last_update_check_ts {
+        Some(ts) => now_unix().saturating_sub(ts) >= 24 * 60 * 60,
+        None => true,
+    }
+}
+
+fn toast(window: &crate::slint_ui::MainWindow, text: &str) {
+    window.set_toast_text(text.into());
+    window.set_toast_visible(true);
+}
+
+fn autostart_detail(status: &AutoStartStatus) -> String {
+    match &status.blocked {
+        Some(BlockReason::DisabledBySystem { since }) => match since {
+            Some(since) => format!("已被系统禁用（{since} 起），点「修复」重新启用"),
+            None => "已被系统禁用，点「修复」重新启用".to_string(),
+        },
+        Some(BlockReason::TargetMissing { path }) => format!("注册的路径已失效：{path}"),
+        Some(BlockReason::NeedsApproval) => status.detail.clone(),
+        Some(BlockReason::PermissionDenied) => status.detail.clone(),
+        Some(BlockReason::Unsupported) => status.detail.clone(),
+        None => status.detail.clone(),
+    }
+}
+
+fn autostart_blocked(status: &AutoStartStatus) -> bool {
+    status.blocked.is_some() || status.requires_user_action
+}
+
+fn parse_proxy_url(url: &str) -> (String, String, String) {
+    let mut protocol = "SOCKS5".to_string();
+    let mut address = "127.0.0.1".to_string();
+    let mut port = "2888".to_string();
+    if url.is_empty() {
+        return (protocol, address, port);
+    }
+    let (scheme, rest): (&str, &str) = url.split_once("://").unwrap_or(("socks5", url));
+    protocol = match scheme.to_ascii_lowercase().as_str() {
+        "socks4" | "socks4a" => "SOCKS4",
+        "https" => "HTTPS",
+        "http" => "HTTP",
+        _ => "SOCKS5",
+    }
+    .to_string();
+    if let Some((addr, p)) = rest.split_once(':') {
+        address = addr.to_string();
+        port = p.to_string();
+    } else {
+        address = rest.to_string();
+    }
+    (protocol, address, port)
+}
+
+fn protocol_to_scheme(proto: &str) -> &'static str {
+    match proto {
+        "SOCKS4" => "socks4",
+        "HTTPS" => "https",
+        "HTTP" => "http",
+        _ => "socks5",
+    }
+}
+
 /// 在后台线程中执行更新检查和下载
-fn do_check_update(
-    version: &str,
-    proxy_url: Option<String>,
-    proxy_username: Option<String>,
-    proxy_password: Option<String>,
-    manual: bool,
-    mock_version: Option<String>,
-    mock_url: Option<String>,
-) {
-    let version_str = version.to_string();
+fn do_check_update(config: Arc<Mutex<AppConfig>>, manual: bool, startup: bool) {
+    let (version, proxy_url, proxy_username, proxy_password, mock_version, mock_url, skip_version, dark) = {
+        let cfg = match config.lock() {
+            Ok(cfg) => cfg,
+            Err(_) => return,
+        };
+        let (proxy_url, proxy_username, proxy_password) =
+            if cfg.proxy_enabled && !cfg.proxy_url.is_empty() {
+                (
+                    Some(cfg.proxy_url.clone()),
+                    cfg.proxy_username.clone(),
+                    cfg.proxy_password.clone(),
+                )
+            } else {
+                (None, None, None)
+            };
+        (
+            env!("CARGO_PKG_VERSION").to_string(),
+            proxy_url,
+            proxy_username,
+            proxy_password,
+            cfg.test_update_version.clone(),
+            cfg.test_update_url.clone(),
+            cfg.skip_update_version.clone(),
+            crate::slint_ui::effective_dark(cfg.theme),
+        )
+    };
     std::thread::spawn(move || {
+        if startup {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         rt.block_on(async {
             match screenhop::updater::check_for_update_with_mock(
-                &version_str,
+                &version,
                 proxy_url.as_deref(),
                 proxy_username.as_deref(),
                 proxy_password.as_deref(),
@@ -56,6 +158,26 @@ fn do_check_update(
                 mock_url.as_deref(),
             ).await {
                 Ok(result) => {
+                    if let Some(err) = &result.error {
+                        log::warn!("检查更新失败: {}", err);
+                        if manual {
+                            crate::slint_ui::show_error("检查更新失败", &err.to_string());
+                        }
+                        return;
+                    }
+
+                    if let Ok(mut cfg) = config.lock() {
+                        cfg.last_update_check_ts = Some(now_unix());
+                        if let Err(err) = cfg.save() {
+                            log::error!("保存配置失败: {}", err);
+                        }
+                    }
+
+                    if skip_version.as_deref() == Some(result.latest_version.as_str()) {
+                        log::info!("跳过版本 {}: 用户已选择跳过", result.latest_version);
+                        return;
+                    }
+
                     if result.has_update {
                         log::info!(
                             "发现新版本: {} → {}",
@@ -63,42 +185,14 @@ fn do_check_update(
                             result.latest_version
                         );
 
-                        #[cfg(target_os = "macos")]
-                        let should_update = {
-                            let mut flag = false;
-                            let script = format!(
-                                "display dialog \"发现新版本: {} \\n是否立即下载并安装？\" with title \"ScreenHop 更新\" buttons {{\"稍后\", \"立即更新\"}} default button 2",
-                                result.latest_version
-                            );
-                            if let Ok(out) = std::process::Command::new("osascript").arg("-e").arg(&script).output() {
-                                if String::from_utf8_lossy(&out.stdout).contains("立即更新") {
-                                    flag = true;
-                                }
-                            }
-                            flag
-                        };
-
-                        #[cfg(target_os = "windows")]
-                        let should_update = {
-                            use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OKCANCEL, IDOK};
-                            use windows::core::{HSTRING, PCWSTR};
-
-                            let text = format!("发现新版本: {}\n是否立即下载并安装？", result.latest_version);
-                            let title = "ScreenHop 更新";
-
-                            let h_text = HSTRING::from(text);
-                            let h_title = HSTRING::from(title);
-
-                            unsafe {
-                                MessageBoxW(
-                                    None,
-                                    PCWSTR(h_text.as_ptr()),
-                                    PCWSTR(h_title.as_ptr()),
-                                    MB_ICONINFORMATION | MB_OKCANCEL,
-                                ) == IDOK
-                            }
-                        };
-
+                        let prompt = format!(
+                            "发现新版本 {}，是否立即下载并安装？",
+                            result.latest_version
+                        );
+                        let should_update =
+                            crate::slint_ui::confirm("发现更新", &prompt, true, "立即更新")
+                                .recv_timeout(std::time::Duration::from_secs(600))
+                                .unwrap_or(false);
 
                         if !should_update {
                             log::info!("用户取消了更新");
@@ -110,13 +204,10 @@ fn do_check_update(
                             let proxy_url_clone2 = proxy_url.clone();
                             let proxy_username_clone2 = proxy_username.clone();
                             let proxy_password_clone2 = proxy_password.clone();
-                            slint::invoke_from_event_loop(move || {
+                            let _ = slint::invoke_from_event_loop(move || {
                                 // 在主线程创建并显示进度框
                                 if let Ok(dialog) = crate::slint_ui::UpdateProgressDialog::new() {
-                                    #[cfg(target_os = "macos")]
-                                    dialog.set_text_font("Heiti SC".into());
-                                    #[cfg(target_os = "windows")]
-                                    dialog.set_text_font("Microsoft YaHei".into());
+                                    crate::slint_ui::apply_theme_progress(&dialog, dark);
 
                                     dialog.set_status_text("准备下载...".into());
                                     dialog.set_progress(0.0);
@@ -137,11 +228,12 @@ fn do_check_update(
                                     });
 
                                     let _ = dialog.show();
+                                    crate::slint_ui::activate_window(&dialog.window());
 
                                     // 共享状态供后台线程和UI线程通讯 (progress, text, can_cancel, finished)
                                     let progress_state = Arc::new(std::sync::Mutex::new((0.0f32, String::new(), true, false)));
 
-                                    let timer_rc = std::rc::Rc::new(std::cell::RefCell::new(Some(slint::Timer::default())));
+                                    let timer_rc = Rc::new(RefCell::new(Some(slint::Timer::default())));
                                     let timer_clone = timer_rc.clone();
 
                                     let progress_state_timer = progress_state.clone();
@@ -266,52 +358,30 @@ fn do_check_update(
                                         });
                                     });
                                 }
-                            }).unwrap();
+                            });
                         } else {
                             log::error!("未找到可用的下载链接");
+                            if manual {
+                                crate::slint_ui::show_error(
+                                    "检查更新",
+                                    "未找到适用于当前平台的安装包",
+                                );
+                            }
                         }
                     } else {
                         log::info!("当前已是最新版本 ({})", result.current_version);
                         if manual {
-                            #[cfg(target_os = "macos")]
-                            {
-                                let script = format!(
-                                    "display dialog \"当前已是最新版本 ({})\" with title \"ScreenHop 更新\" buttons {{\"确定\"}} default button 1",
-                                    result.current_version
-                                );
-                                let _ = std::process::Command::new("osascript").arg("-e").arg(&script).output();
-                            }
-
-                            #[cfg(target_os = "windows")]
-                            {
-                                use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
-                                use windows::core::{HSTRING, PCWSTR};
-
-                                let text = format!("当前已是最新版本 ({})", result.current_version);
-                                let title = "ScreenHop 更新";
-
-                                let h_text = HSTRING::from(text);
-                                let h_title = HSTRING::from(title);
-
-                                unsafe {
-                                    MessageBoxW(
-                                        None,
-                                        PCWSTR(h_text.as_ptr()),
-                                        PCWSTR(h_title.as_ptr()),
-                                        MB_ICONINFORMATION | MB_OK,
-                                    );
-                                }
-                            }
+                            crate::slint_ui::show_alert(
+                                "已是最新版本",
+                                &format!("当前版本 {} 已是最新。", result.current_version),
+                            );
                         }
                     }
                 }
                 Err(e) => {
                     log::error!("检查更新失败: {}", e);
                     if manual {
-                        screenhop::alert_error!(
-                            "ScreenHop 更新",
-                            &format!("检查更新失败: {}", e)
-                        );
+                        crate::slint_ui::show_error("检查更新失败", &e.to_string());
                     }
                 }
             }
@@ -326,11 +396,482 @@ struct MenuItems {
     proxy_enable_item: MenuItem,
 }
 
+fn set_autostart_menu(items: &MenuItems, enabled: bool) {
+    items.autostart_item.set_text(if enabled {
+        "✓ 开机自动启动"
+    } else {
+        "  开机自动启动"
+    });
+}
+
+#[derive(Clone, PartialEq)]
+struct SettingsSnapshot {
+    dark: bool,
+    disable_hook: bool,
+    title_bar_height: f64,
+    auto_check_update: bool,
+    proxy_enabled: bool,
+    proxy_url: String,
+    proxy_username: Option<String>,
+    proxy_password: Option<String>,
+    last_update_check_ts: Option<i64>,
+}
+
+impl SettingsSnapshot {
+    fn from_config(cfg: &AppConfig, dark: bool) -> Self {
+        Self {
+            dark,
+            disable_hook: cfg.disable_hook,
+            title_bar_height: cfg.title_bar_height,
+            auto_check_update: cfg.auto_check_update,
+            proxy_enabled: cfg.proxy_enabled,
+            proxy_url: cfg.proxy_url.clone(),
+            proxy_username: cfg.proxy_username.clone(),
+            proxy_password: cfg.proxy_password.clone(),
+            last_update_check_ts: cfg.last_update_check_ts,
+        }
+    }
+}
+
+thread_local! {
+    static APPLIED_SETTINGS: RefCell<Option<SettingsSnapshot>> = const { RefCell::new(None) };
+    static PROXY_CONFLICT_NOTIFIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn proxy_has_draft(
+    window: &crate::slint_ui::MainWindow,
+    applied: Option<&SettingsSnapshot>,
+) -> bool {
+    let Some(applied) = applied else {
+        return false;
+    };
+    let (protocol, address, port) = parse_proxy_url(&applied.proxy_url);
+    window.get_proxy_protocol().as_str() != protocol
+        || window.get_proxy_address().as_str() != address
+        || window.get_proxy_port().as_str() != port
+        || window.get_proxy_auth() != applied.proxy_username.is_some()
+        || window.get_proxy_username().as_str() != applied.proxy_username.clone().unwrap_or_default()
+        || window.get_proxy_password().as_str() != applied.proxy_password.clone().unwrap_or_default()
+}
+
+fn proxy_changed_externally(
+    applied: Option<&SettingsSnapshot>,
+    snapshot: &SettingsSnapshot,
+) -> bool {
+    let Some(applied) = applied else {
+        return false;
+    };
+    applied.proxy_url != snapshot.proxy_url
+        || applied.proxy_enabled != snapshot.proxy_enabled
+        || applied.proxy_username != snapshot.proxy_username
+        || applied.proxy_password != snapshot.proxy_password
+}
+
+fn refresh_settings_window(
+    window: &crate::slint_ui::MainWindow,
+    config: &Arc<Mutex<AppConfig>>,
+    dark: bool,
+) {
+    let total = std::time::Instant::now();
+    let lock_started = std::time::Instant::now();
+    let cfg = match config.lock() {
+        Ok(cfg) => cfg.clone(),
+        Err(_) => return,
+    };
+    let lock_elapsed = lock_started.elapsed();
+    let snapshot = SettingsSnapshot::from_config(&cfg, dark);
+    let previous = APPLIED_SETTINGS.with(|applied| applied.borrow().clone());
+    let full = previous.is_none();
+    let stale = |equal: bool| full || !equal;
+    let theme_same = previous.as_ref().map_or(false, |p| p.dark == snapshot.dark);
+    let hook_same = previous
+        .as_ref()
+        .map_or(false, |p| p.disable_hook == snapshot.disable_hook);
+    let height_same = previous
+        .as_ref()
+        .map_or(false, |p| p.title_bar_height == snapshot.title_bar_height);
+    let auto_check_same = previous
+        .as_ref()
+        .map_or(false, |p| p.auto_check_update == snapshot.auto_check_update);
+    let proxy_enabled_same = previous
+        .as_ref()
+        .map_or(false, |p| p.proxy_enabled == snapshot.proxy_enabled);
+    let proxy_auth_same = previous
+        .as_ref()
+        .map_or(false, |p| p.proxy_username.is_some() == snapshot.proxy_username.is_some());
+    let proxy_username_same = previous
+        .as_ref()
+        .map_or(false, |p| p.proxy_username == snapshot.proxy_username);
+    let proxy_password_same = previous
+        .as_ref()
+        .map_or(false, |p| p.proxy_password == snapshot.proxy_password);
+    let proxy_url_same = previous
+        .as_ref()
+        .map_or(false, |p| p.proxy_url == snapshot.proxy_url);
+    let last_check_same = previous
+        .as_ref()
+        .map_or(false, |p| p.last_update_check_ts == snapshot.last_update_check_ts);
+
+    let apply_started = std::time::Instant::now();
+    if stale(theme_same) {
+        crate::slint_ui::apply_theme_main(window, dark);
+    }
+    if full {
+        window.set_version_text(env!("CARGO_PKG_VERSION").into());
+        window.set_log_path(std::env::temp_dir().to_string_lossy().to_string().into());
+    }
+    if stale(hook_same) {
+        window.set_hook_enabled(!cfg.disable_hook);
+    }
+    if stale(height_same) {
+        window.set_title_height(cfg.title_bar_height as f32);
+        window.set_title_height_text(format!("{} px", cfg.title_bar_height.round() as i32).into());
+    }
+    if stale(auto_check_same) {
+        window.set_auto_check(cfg.auto_check_update);
+    }
+    let proxy_draft = proxy_has_draft(window, previous.as_ref());
+    let proxy_conflict = proxy_draft && proxy_changed_externally(previous.as_ref(), &snapshot);
+    if proxy_conflict {
+        let first = PROXY_CONFLICT_NOTIFIED.with(|flag| !flag.replace(true));
+        if first {
+            toast(window, "代理页有未保存修改，已保留；保存后将覆盖外部改动");
+        }
+        log::info!("代理草稿与外部配置冲突，保留草稿");
+    } else {
+        PROXY_CONFLICT_NOTIFIED.with(|flag| flag.set(false));
+        if stale(proxy_enabled_same) {
+            window.set_proxy_enabled(cfg.proxy_enabled);
+        }
+        if stale(proxy_auth_same) {
+            window.set_proxy_auth(cfg.proxy_username.is_some());
+        }
+        if stale(proxy_username_same) {
+            window.set_proxy_username(cfg.proxy_username.clone().unwrap_or_default().into());
+        }
+        if stale(proxy_password_same) {
+            window.set_proxy_password(cfg.proxy_password.clone().unwrap_or_default().into());
+        }
+        if stale(proxy_url_same) {
+            let (protocol, address, port) = parse_proxy_url(&cfg.proxy_url);
+            window.set_proxy_protocol(protocol.into());
+            window.set_proxy_address(address.into());
+            window.set_proxy_port(port.into());
+        }
+    }
+    if stale(last_check_same) {
+        window.set_last_check_text(match cfg.last_update_check_ts {
+            Some(ts) => format!("上次检查：{}", crate::slint_ui::format_unix_ts(ts)).into(),
+            None => "尚未检查更新".into(),
+        });
+    }
+    let apply_elapsed = apply_started.elapsed();
+
+    let autostart_started = std::time::Instant::now();
+    match screenhop_platform::auto_start().status() {
+        Ok(status) => {
+            window.set_autostart_enabled(status.enabled);
+            window.set_autostart_blocked(autostart_blocked(&status));
+            window.set_autostart_detail(autostart_detail(&status).into());
+        }
+        Err(err) => {
+            window.set_autostart_blocked(true);
+            window.set_autostart_detail(format!("读取开机自启动状态失败：{err}").into());
+        }
+    }
+    let autostart_elapsed = autostart_started.elapsed();
+
+    APPLIED_SETTINGS.with(|applied| *applied.borrow_mut() = Some(snapshot));
+
+    log::info!(
+        "设置窗口刷新：{}，锁 {:?}，应用 {:?}，自启状态 {:?}，合计 {:?}",
+        if full { "全量" } else { "增量" },
+        lock_elapsed,
+        apply_elapsed,
+        autostart_elapsed,
+        total.elapsed()
+    );
+}
+
+fn sync_settings_window(
+    settings: &Rc<RefCell<Option<crate::slint_ui::MainWindow>>>,
+    config: &Arc<Mutex<AppConfig>>,
+) {
+    let slot = settings.borrow();
+    let Some(window) = slot.as_ref() else {
+        return;
+    };
+    let dark = config
+        .lock()
+        .map(|cfg| crate::slint_ui::effective_dark(cfg.theme))
+        .unwrap_or(false);
+    refresh_settings_window(window, config, dark);
+}
+
+fn ensure_system_theme(config: &Arc<Mutex<AppConfig>>) {
+    let auto = config
+        .lock()
+        .map(|cfg| cfg.theme == screenhop::config::Theme::Auto)
+        .unwrap_or(false);
+    if !auto || crate::slint_ui::cached_system_dark().is_some() {
+        return;
+    }
+    crate::slint_ui::refresh_system_dark(|_| {});
+}
+
+fn create_settings_window(
+    config: &Arc<Mutex<AppConfig>>,
+    items: &Rc<MenuItems>,
+    dark: bool,
+) -> Option<crate::slint_ui::MainWindow> {
+    let window = crate::slint_ui::MainWindow::new().ok()?;
+    crate::slint_ui::bind_main_window(&window);
+    refresh_settings_window(&window, config, dark);
+
+    let weak = window.as_weak();
+    window.on_close_requested(move || {
+        APPLIED_SETTINGS.with(|applied| *applied.borrow_mut() = None);
+        PROXY_CONFLICT_NOTIFIED.with(|flag| flag.set(false));
+        if let Some(window) = weak.upgrade() {
+            let _ = window.hide();
+        }
+    });
+
+    let weak = window.as_weak();
+    window.on_minimize_requested(move || {
+        if let Some(window) = weak.upgrade() {
+            window.window().set_minimized(true);
+        }
+    });
+
+    let weak = window.as_weak();
+    let config_clone = config.clone();
+    let items_clone = items.clone();
+    window.on_hook_toggled(move |enabled| {
+        if let Ok(mut cfg) = config_clone.lock() {
+            cfg.disable_hook = !enabled;
+            crate::app::set_hook_enabled(enabled);
+            items_clone.toggle_item.set_text(if enabled {
+                "禁用鼠标中键移动"
+            } else {
+                "启用鼠标中键移动"
+            });
+            if let Err(err) = cfg.save() {
+                log::error!("保存配置失败: {}", err);
+            }
+        }
+        if let Some(window) = weak.upgrade() {
+            toast(&window, if enabled { "已启用" } else { "已禁用" });
+        }
+    });
+
+    let weak = window.as_weak();
+    let config_clone = config.clone();
+    window.on_title_height_changed(move |value| {
+        if let Ok(mut cfg) = config_clone.lock() {
+            cfg.title_bar_height = value as f64;
+            if let Err(err) = cfg.save() {
+                log::error!("保存配置失败: {}", err);
+            }
+        }
+        if let Some(window) = weak.upgrade() {
+            window.set_title_height_text(format!("{} px", value.round() as i32).into());
+        }
+    });
+
+    let weak = window.as_weak();
+    let config_clone = config.clone();
+    let items_clone = items.clone();
+    window.on_autostart_toggled(move |enabled| {
+        let auto = screenhop_platform::auto_start();
+        match auto.set_enabled(enabled) {
+            Ok(status) => {
+                set_autostart_menu(&items_clone, status.enabled);
+                if let Ok(mut cfg) = config_clone.lock() {
+                    cfg.auto_start = status.enabled;
+                    if let Err(err) = cfg.save() {
+                        log::error!("保存配置失败: {}", err);
+                    }
+                }
+                if let Some(window) = weak.upgrade() {
+                    window.set_autostart_enabled(status.enabled);
+                    window.set_autostart_blocked(autostart_blocked(&status));
+                    window.set_autostart_detail(autostart_detail(&status).into());
+                }
+                if status.requires_user_action {
+                    crate::slint_ui::show_alert("开机自启动", &status.detail);
+                }
+            }
+            Err(err) => {
+                log::error!("设置开机自启动失败: {:?}", err);
+                crate::slint_ui::show_error("开机自启动", &format!("设置失败：{err}"));
+                if let Some(window) = weak.upgrade() {
+                    match auto.status() {
+                        Ok(status) => {
+                            window.set_autostart_enabled(status.enabled);
+                            window.set_autostart_blocked(autostart_blocked(&status));
+                            window.set_autostart_detail(autostart_detail(&status).into());
+                        }
+                        Err(_) => window.set_autostart_enabled(!enabled),
+                    }
+                }
+            }
+        }
+    });
+
+    let weak = window.as_weak();
+    let config_clone = config.clone();
+    let items_clone = items.clone();
+    window.on_fix_autostart(move || {
+        let auto = screenhop_platform::auto_start();
+        match auto.set_enabled(true) {
+            Ok(status) => {
+                set_autostart_menu(&items_clone, status.enabled);
+                if let Ok(mut cfg) = config_clone.lock() {
+                    cfg.auto_start = status.enabled;
+                    if let Err(err) = cfg.save() {
+                        log::error!("保存配置失败: {}", err);
+                    }
+                }
+                if let Some(window) = weak.upgrade() {
+                    window.set_autostart_enabled(status.enabled);
+                    window.set_autostart_blocked(autostart_blocked(&status));
+                    window.set_autostart_detail(autostart_detail(&status).into());
+                    toast(&window, "已尝试修复开机自启动");
+                }
+                if status.requires_user_action {
+                    crate::slint_ui::show_alert("开机自启动", &status.detail);
+                }
+            }
+            Err(err) => {
+                log::error!("修复开机自启动失败: {:?}", err);
+                crate::slint_ui::show_error("开机自启动", &format!("修复失败：{err}"));
+            }
+        }
+    });
+
+    let config_clone = config.clone();
+    let items_clone = items.clone();
+    window.on_proxy_enabled_toggled(move |enabled| {
+        if let Ok(mut cfg) = config_clone.lock() {
+            cfg.proxy_enabled = enabled;
+            items_clone.proxy_enable_item.set_text(if enabled {
+                "✓ 启用代理"
+            } else {
+                "  启用代理"
+            });
+            if enabled && cfg.proxy_url.is_empty() {
+                cfg.proxy_url = "socks5://127.0.0.1:2888".to_string();
+            }
+            if let Err(err) = cfg.save() {
+                log::error!("保存配置失败: {}", err);
+            }
+        }
+    });
+
+    let weak = window.as_weak();
+    let config_clone = config.clone();
+    let items_clone = items.clone();
+    window.on_save_proxy(move || {
+        let Some(window) = weak.upgrade() else {
+            return;
+        };
+        let address = window.get_proxy_address().to_string();
+        let port = window.get_proxy_port().to_string();
+        let protocol = window.get_proxy_protocol().to_string();
+        let auth = window.get_proxy_auth();
+        let username = window.get_proxy_username().to_string();
+        let password = window.get_proxy_password().to_string();
+        let url = format!("{}://{}:{}", protocol_to_scheme(&protocol), address, port);
+
+        let mut overwrote = false;
+        if let Ok(mut cfg) = config_clone.lock() {
+            overwrote = APPLIED_SETTINGS.with(|applied| {
+                applied.borrow().as_ref().map_or(false, |applied| {
+                    applied.proxy_url != cfg.proxy_url
+                        || applied.proxy_enabled != cfg.proxy_enabled
+                        || applied.proxy_username != cfg.proxy_username
+                        || applied.proxy_password != cfg.proxy_password
+                })
+            });
+            cfg.proxy_url = url;
+            cfg.proxy_enabled = true;
+            if auth && !username.is_empty() {
+                cfg.proxy_username = Some(username);
+                cfg.proxy_password = Some(password);
+            } else {
+                cfg.proxy_username = None;
+                cfg.proxy_password = None;
+            }
+            items_clone.proxy_enable_item.set_text("✓ 启用代理");
+            if let Err(err) = cfg.save() {
+                log::error!("保存配置失败: {}", err);
+            }
+        }
+        APPLIED_SETTINGS.with(|applied| *applied.borrow_mut() = None);
+        PROXY_CONFLICT_NOTIFIED.with(|flag| flag.set(false));
+        window.set_proxy_enabled(true);
+        toast(
+            &window,
+            if overwrote {
+                "已覆盖外部改动并保存代理设置"
+            } else {
+                "代理设置已保存"
+            },
+        );
+    });
+
+    let config_clone = config.clone();
+    let items_clone = items.clone();
+    window.on_auto_check_toggled(move |enabled| {
+        if let Ok(mut cfg) = config_clone.lock() {
+            cfg.auto_check_update = enabled;
+            items_clone.auto_check_update_item.set_text(if enabled {
+                "✓ 启动时检查更新"
+            } else {
+                "  启动时检查更新"
+            });
+            if let Err(err) = cfg.save() {
+                log::error!("保存配置失败: {}", err);
+            }
+        }
+    });
+
+    let weak = window.as_weak();
+    let config_clone = config.clone();
+    window.on_check_now(move || {
+        if let Some(window) = weak.upgrade() {
+            window.set_check_busy(true);
+            toast(&window, "正在检查更新…");
+        }
+        do_check_update(config_clone.clone(), true, false);
+        if let Some(window) = weak.upgrade() {
+            window.set_last_check_text(
+                format!("上次检查：{}", crate::slint_ui::format_unix_ts(now_unix())).into(),
+            );
+        }
+    });
+
+    window.on_open_repo(move || {
+        let _ = open::that(REPO_URL);
+    });
+
+    window.on_open_logs(move || {
+        let _ = open::that(std::env::temp_dir());
+    });
+
+    let _ = window.show();
+    crate::slint_ui::activate_window(&window.window());
+    Some(window)
+}
+
 /// 运行托盘应用主循环
 pub fn run_app(config: AppConfig) -> Result<()> {
     // 我们现在使用 slint::run_event_loop_until_quit()，不再需要隐藏窗口来维持事件循环
 
     let config = Arc::new(Mutex::new(config));
+
+    crate::slint_ui::refresh_system_dark(|_| {});
 
     // 创建菜单
     let menu = Menu::new();
@@ -346,9 +887,30 @@ pub fn run_app(config: AppConfig) -> Result<()> {
         true,
         None,
     );
+    let settings_item = MenuItem::with_id(MENU_ID_SETTINGS, "设置...", true, None);
+    let autostart_status = match screenhop_platform::auto_start().status() {
+        Ok(status) => {
+            if let Ok(mut cfg) = config.lock() {
+                if cfg.auto_start != status.enabled {
+                    cfg.auto_start = status.enabled;
+                    if let Err(err) = cfg.save() {
+                        log::error!("保存配置失败: {}", err);
+                    }
+                }
+            }
+            if status.requires_user_action {
+                log::warn!("开机自启动需要用户处理: {}", status.detail);
+            }
+            status
+        }
+        Err(err) => {
+            log::error!("读取开机自启动状态失败: {:?}", err);
+            AutoStartStatus::disabled("读取开机自启动状态失败")
+        }
+    };
     let autostart_item = MenuItem::with_id(
         MENU_ID_AUTOSTART,
-        if config.lock().unwrap().auto_start {
+        if autostart_status.enabled {
             "✓ 开机自动启动"
         } else {
             "  开机自动启动"
@@ -392,6 +954,7 @@ pub fn run_app(config: AppConfig) -> Result<()> {
     menu.append(&status_item).ok();
     menu.append(&separator).ok();
     menu.append(&toggle_item).ok();
+    menu.append(&settings_item).ok();
     menu.append(&autostart_item).ok();
     menu.append(&update_item).ok();
     menu.append(&auto_check_update_item).ok();
@@ -409,43 +972,32 @@ pub fn run_app(config: AppConfig) -> Result<()> {
 
     log::info!("系统托盘图标已创建");
 
-    // 启动时自动检查更新
-    // - 若 auto_check_update 启用，走正常流程
-    // - 若配置了 test_update_version（mock 测试模式），无论 auto_check_update 如何都强制触发
+    // 启动时自动检查更新（延迟 3s，避开启动竞态；24h 冷却）
     {
-        let cfg = config.lock().unwrap();
-        if cfg.auto_check_update || cfg.test_update_version.is_some() {
+        let should_check = match config.lock() {
+            Ok(cfg) => should_auto_check(&cfg),
+            Err(_) => false,
+        };
+        if should_check {
             log::info!("启动时自动检查更新...");
-            let (proxy_url, proxy_username, proxy_password) =
-                if cfg.proxy_enabled && !cfg.proxy_url.is_empty() {
-                    (
-                        Some(cfg.proxy_url.clone()),
-                        cfg.proxy_username.clone(),
-                        cfg.proxy_password.clone(),
-                    )
-                } else {
-                    (None, None, None)
-                };
-            do_check_update(
-                env!("CARGO_PKG_VERSION"),
-                proxy_url,
-                proxy_username,
-                proxy_password,
-                false,
-                cfg.test_update_version.clone(),
-                cfg.test_update_url.clone(),
-            );
+            do_check_update(config.clone(), false, true);
+        } else {
+            log::info!("跳过启动时更新检查（已关闭或处于冷却期）");
         }
     }
 
     // 在主线程处理 Slint 和 MenuEvents
-    let menu_items = MenuItems {
+    let menu_items = Rc::new(MenuItems {
         toggle_item,
         autostart_item,
         auto_check_update_item,
         proxy_enable_item,
-    };
+    });
+    let settings_window: Rc<RefCell<Option<crate::slint_ui::MainWindow>>> =
+        Rc::new(RefCell::new(None));
     let config_clone = config.clone();
+    let menu_items_clone = menu_items.clone();
+    let settings_window_clone = settings_window.clone();
 
     #[cfg(target_os = "macos")]
     let mut macos_policy_set = false;
@@ -488,11 +1040,21 @@ pub fn run_app(config: AppConfig) -> Result<()> {
                 macos_policy_set = true;
             }
 
+            if crate::slint_ui::take_theme_refresh() {
+                APPLIED_SETTINGS.with(|applied| *applied.borrow_mut() = None);
+                sync_settings_window(&settings_window_clone, &config_clone);
+            }
+
             while let Ok(event) = MenuEvent::receiver().try_recv() {
                 if event.id.0 == MENU_ID_QUIT {
                     std::process::exit(0);
                 }
-                handle_menu_event(&event.id.0, &menu_items, &config_clone);
+                handle_menu_event(
+                    &event.id.0,
+                    &menu_items_clone,
+                    &config_clone,
+                    &settings_window_clone,
+                );
             }
         },
     );
@@ -500,7 +1062,12 @@ pub fn run_app(config: AppConfig) -> Result<()> {
     Ok(())
 }
 
-fn handle_menu_event(id: &str, items: &MenuItems, config: &Arc<Mutex<AppConfig>>) {
+fn handle_menu_event(
+    id: &str,
+    items: &Rc<MenuItems>,
+    config: &Arc<Mutex<AppConfig>>,
+    settings: &Rc<RefCell<Option<crate::slint_ui::MainWindow>>>,
+) {
     match id {
         MENU_ID_TOGGLE => {
             if let Ok(mut cfg) = config.lock() {
@@ -526,89 +1093,66 @@ fn handle_menu_event(id: &str, items: &MenuItems, config: &Arc<Mutex<AppConfig>>
                     log::error!("保存配置失败: {}", e);
                 }
             }
+            sync_settings_window(settings, config);
         }
-        MENU_ID_AUTOSTART => {
-            if let Ok(mut cfg) = config.lock() {
-                cfg.auto_start = !cfg.auto_start;
-                log::info!("开机自启动: {}", cfg.auto_start);
-
-                let text = if cfg.auto_start {
-                    "✓ 开机自动启动"
-                } else {
-                    "  开机自动启动"
-                };
-                items.autostart_item.set_text(text);
-
-                #[cfg(target_os = "macos")]
-                {
-                    use screenhop_platform::AutoStart;
-                    let auto = screenhop_platform::macos::autostart::MacAutoStart::new();
-                    if let Err(e) = auto.set_enabled(cfg.auto_start) {
-                        log::error!("设置自启动失败: {}", e);
-                    }
+        MENU_ID_SETTINGS => {
+            let started = std::time::Instant::now();
+            let dark = config
+                .lock()
+                .map(|cfg| crate::slint_ui::effective_dark(cfg.theme))
+                .unwrap_or(false);
+            log::info!("设置菜单主题解析耗时 {:?}", started.elapsed());
+            let mut slot = settings.borrow_mut();
+            match slot.as_ref() {
+                Some(window) => {
+                    refresh_settings_window(window, config, dark);
+                    let _ = window.show();
+                    crate::slint_ui::activate_window(&window.window());
                 }
-
-                #[cfg(target_os = "windows")]
-                {
-                    use screenhop_platform::AutoStart;
-                    let auto = screenhop_platform::windows::autostart::WinAutoStart::new();
-                    if let Err(e) = auto.set_enabled(cfg.auto_start) {
-                        log::error!("设置自启动失败: {:?}", e);
-                        // 弹窗告知用户失败原因
-                        screenhop::alert_error!(
-                            "ScreenHop",
-                            &format!("设置开机自启动失败:\n{}", e)
-                        );
-                        // 回滚菜单状态
-                        cfg.auto_start = !cfg.auto_start;
-                        items.autostart_item.set_text(if cfg.auto_start {
-                            "✓ 开机自动启动"
-                        } else {
-                            "  开机自动启动"
-                        });
+                None => {
+                    if let Some(window) = create_settings_window(config, items, dark) {
+                        *slot = Some(window);
                     }
-                }
-
-                if let Err(e) = cfg.save() {
-                    log::error!("保存配置失败: {}", e);
                 }
             }
+            drop(slot);
+            ensure_system_theme(config);
+            log::info!("设置菜单处理耗时 {:?}", started.elapsed());
+        }
+        MENU_ID_AUTOSTART => {
+            let desired = match config.lock() {
+                Ok(cfg) => !cfg.auto_start,
+                Err(_) => false,
+            };
+            let auto = screenhop_platform::auto_start();
+            match auto.set_enabled(desired) {
+                Ok(status) => {
+                    log::info!("开机自启动: {} ({})", status.enabled, status.detail);
+                    set_autostart_menu(items, status.enabled);
+                    if let Ok(mut cfg) = config.lock() {
+                        cfg.auto_start = status.enabled;
+                        if let Err(err) = cfg.save() {
+                            log::error!("保存配置失败: {}", err);
+                        }
+                    }
+                    if status.requires_user_action {
+                        crate::slint_ui::show_alert("开机自启动", &status.detail);
+                    }
+                }
+                Err(err) => {
+                    log::error!("设置开机自启动失败: {:?}", err);
+                    crate::slint_ui::show_error(
+                        "设置开机自启动失败",
+                        &format!("{err}"),
+                    );
+                }
+            }
+            sync_settings_window(settings, config);
         }
 
         MENU_ID_CHECK_UPDATE => {
             log::info!("手动检查更新...");
-            let (proxy_url, proxy_username, proxy_password, mock_version, mock_url) =
-                match config.lock() {
-                    Ok(cfg) => {
-                        if cfg.proxy_enabled && !cfg.proxy_url.is_empty() {
-                            (
-                                Some(cfg.proxy_url.clone()),
-                                cfg.proxy_username.clone(),
-                                cfg.proxy_password.clone(),
-                                cfg.test_update_version.clone(),
-                                cfg.test_update_url.clone(),
-                            )
-                        } else {
-                            (
-                                None,
-                                None,
-                                None,
-                                cfg.test_update_version.clone(),
-                                cfg.test_update_url.clone(),
-                            )
-                        }
-                    }
-                    _ => (None, None, None, None, None),
-                };
-            do_check_update(
-                env!("CARGO_PKG_VERSION"),
-                proxy_url,
-                proxy_username,
-                proxy_password,
-                true,
-                mock_version,
-                mock_url,
-            );
+            do_check_update(config.clone(), true, false);
         }
         MENU_ID_AUTO_CHECK_UPDATE => {
             if let Ok(mut cfg) = config.lock() {
@@ -626,6 +1170,7 @@ fn handle_menu_event(id: &str, items: &MenuItems, config: &Arc<Mutex<AppConfig>>
                     log::error!("保存配置失败: {}", e);
                 }
             }
+            sync_settings_window(settings, config);
         }
         MENU_ID_PROXY_ENABLE => {
             if let Ok(mut cfg) = config.lock() {
@@ -649,6 +1194,7 @@ fn handle_menu_event(id: &str, items: &MenuItems, config: &Arc<Mutex<AppConfig>>
                     }
                 }
             }
+            sync_settings_window(settings, config);
         }
         MENU_ID_PROXY_SETTINGS => {
             let (mut address, mut port, mut protocol, mut username, mut password, mut enabled) = (
@@ -689,9 +1235,11 @@ fn handle_menu_event(id: &str, items: &MenuItems, config: &Arc<Mutex<AppConfig>>
             }
 
             let dialog = crate::slint_ui::ProxyAuthDialog::new().unwrap();
-
-            #[cfg(target_os = "windows")]
-            dialog.set_text_font("Microsoft YaHei".into());
+            let dark = config
+                .lock()
+                .map(|cfg| crate::slint_ui::effective_dark(cfg.theme))
+                .unwrap_or(false);
+            crate::slint_ui::apply_theme_proxy(&dialog, dark);
 
             dialog.set_address(address.into());
             dialog.set_port(port.into());
@@ -751,16 +1299,7 @@ fn handle_menu_event(id: &str, items: &MenuItems, config: &Arc<Mutex<AppConfig>>
             );
 
             let _ = dialog.show();
-
-            // macOS: 强制激活当前应用并将其置于前台，解决第一次启动不聚焦的问题
-            #[cfg(target_os = "macos")]
-            #[allow(deprecated)]
-            unsafe {
-                use cocoa::appkit::NSApp;
-                use objc::*;
-                let app = NSApp();
-                let _: () = msg_send![app, activateIgnoringOtherApps: true];
-            }
+            crate::slint_ui::activate_window(&dialog.window());
         }
         MENU_ID_QUIT => {
             log::info!("用户请求退出");

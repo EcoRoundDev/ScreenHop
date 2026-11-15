@@ -1,41 +1,24 @@
 use anyhow::{anyhow, bail, Context, Result};
-use std::{
-    env,
-    ffi::OsString,
-    fs,
-    os::windows::{
-        ffi::{OsStrExt, OsStringExt},
-        process::CommandExt,
-    },
-    process::Command,
-};
-use windows::core::{w, PCWSTR, PWSTR};
-use windows::Win32::{
-    Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, HANDLE},
-    Security::{
-        Authorization::ConvertSidToStringSidW, GetSidSubAuthority, GetSidSubAuthorityCount,
-        GetTokenInformation, LookupAccountSidW, TokenElevation, TokenElevationType,
-        TokenElevationTypeFull, TokenIntegrityLevel, TokenUser, SID_NAME_USE, TOKEN_ELEVATION,
-        TOKEN_ELEVATION_TYPE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER,
-    },
-    System::{
-        Registry::{
-            RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegGetValueW, RegSetValueExW, HKEY,
-            HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
-            REG_VALUE_TYPE, RRF_RT_REG_SZ,
-        },
-        SystemInformation::GetLocalTime,
-        Threading::{GetCurrentProcess, OpenProcessToken, CREATE_NO_WINDOW},
-    },
+use std::path::Path;
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+use windows::Win32::System::Registry::{
+    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegGetValueW, RegSetValueExW, HKEY, REG_SAM_FLAGS,
+    HKEY_CURRENT_USER,
+    KEY_QUERY_VALUE, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_ROUTINE_FLAGS, REG_SZ,
+    REG_VALUE_TYPE, RRF_RT_REG_BINARY, RRF_RT_REG_SZ,
 };
 
-use crate::AutoStart;
+use crate::{AutoStart, AutoStartStatus, BlockReason};
 
-const TASK_NAME: &str = "ScreenHop";
-const HKEY_RUN: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-const HKEY_NAME: PCWSTR = w!("ScreenHop");
+const VALUE_NAME: &str = "ScreenHop";
+const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+const APPROVED_KEY: &str =
+    "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run";
 
-pub struct WinAutoStart;
+pub struct WinAutoStart {
+    backend: Box<dyn RegistryBackend>,
+}
 
 impl Default for WinAutoStart {
     fn default() -> Self {
@@ -45,472 +28,378 @@ impl Default for WinAutoStart {
 
 impl WinAutoStart {
     pub fn new() -> Self {
-        Self
-    }
-
-    fn exe_path_u16() -> Result<Vec<u16>> {
-        let path = std::env::current_exe().context("Failed to get current exe path")?;
-        let mut path_u16: Vec<u16> = path.into_os_string().encode_wide().collect();
-        path_u16.push(0);
-        Ok(path_u16)
+        Self {
+            backend: Box::new(WinRegistry),
+        }
     }
 }
 
 impl AutoStart for WinAutoStart {
-    fn is_enabled(&self) -> bool {
-        let is_admin = is_running_as_admin().unwrap_or(false);
-        if is_admin {
-            exist_scheduled_task(TASK_NAME).unwrap_or(false)
-        } else {
-            if let Ok(exe_path) = Self::exe_path_u16() {
-                reg_is_enable(&exe_path).unwrap_or(false)
-            } else {
-                false
-            }
-        }
+    fn status(&self) -> Result<AutoStartStatus> {
+        let exe = std::env::current_exe().context("无法获取当前程序路径")?;
+        let run = self.backend.read_string(RUN_KEY, VALUE_NAME)?;
+        let approved = self.backend.read_binary(APPROVED_KEY, VALUE_NAME)?;
+        Ok(evaluate(run.as_deref(), approved.as_deref(), &exe))
     }
 
-    fn set_enabled(&self, enabled: bool) -> Result<()> {
-        let is_admin = is_running_as_admin().unwrap_or(false);
-        let exe_path = Self::exe_path_u16()?;
-
+    fn set_enabled(&self, enabled: bool) -> Result<AutoStartStatus> {
+        let exe = std::env::current_exe().context("无法获取当前程序路径")?;
         if enabled {
-            if is_admin {
-                let _ = reg_disable();
-                let path_str = std::env::current_exe()?.to_string_lossy().to_string();
-                create_scheduled_task(TASK_NAME, &path_str)?;
-                log::info!("已在计划任务中启用开机自启（管理员模式）");
-            } else {
-                if exist_scheduled_task(TASK_NAME).unwrap_or(false) {
-                    log::warn!("请注意：您曾以管理员身份开启过自启动。为避免冲突，请先以管理员身份运行关闭它，再在普通模式开启。");
-                }
-                reg_enable(&exe_path)?;
-                log::info!("已在注册表中启用开机自启（普通用户模式）");
+            let quoted = format!("\"{}\"", exe.display());
+            self.backend.write_string(RUN_KEY, VALUE_NAME, &quoted)?;
+            self.backend.delete(APPROVED_KEY, VALUE_NAME)?;
+            let status = self.status()?;
+            if !status.enabled {
+                bail!("写入开机启动项后校验失败：{}", status.detail);
             }
+            log::info!("已启用开机自启动: {}", exe.display());
+            Ok(status)
         } else {
-            if is_admin {
-                let _ = delete_scheduled_task(TASK_NAME);
-                let _ = reg_disable();
-                log::info!("已清理计划任务和注册表自启");
-            } else {
-                reg_disable()?;
-                log::info!("已清理注册表自启");
-            }
-        }
-        Ok(())
-    }
-}
-
-/* ==========================================================================
- * Handle Wrapper
- * ========================================================================== */
-
-#[derive(Debug)]
-struct HandleWrapper(HANDLE);
-impl Default for HandleWrapper {
-    fn default() -> Self {
-        Self(HANDLE(std::ptr::null_mut()))
-    }
-}
-impl HandleWrapper {
-    fn get_handle_mut(&mut self) -> &mut HANDLE {
-        &mut self.0
-    }
-    fn get_handle(&self) -> HANDLE {
-        self.0
-    }
-}
-impl Drop for HandleWrapper {
-    fn drop(&mut self) {
-        if !self.0 .0.is_null() {
-            unsafe {
-                let _ = CloseHandle(self.0);
-            }
+            self.backend.delete(RUN_KEY, VALUE_NAME)?;
+            self.backend.delete(APPROVED_KEY, VALUE_NAME)?;
+            log::info!("已关闭开机自启动");
+            Ok(AutoStartStatus::disabled("开机自启动已关闭"))
         }
     }
 }
 
-/* ==========================================================================
- * Admin & Elevation Check
- * ========================================================================== */
-
-const SECURITY_MANDATORY_HIGH_RID: u32 = 0x00003000;
-const SECURITY_MANDATORY_SYSTEM_RID: u32 = 0x00004000;
-
-fn is_running_as_admin() -> Result<bool> {
-    let process = unsafe { GetCurrentProcess() };
-    get_process_elevation_info(process)
-        .map_err(|err| anyhow!("Failed to verify if the program is running as admin, {err}"))
-}
-
-fn get_process_elevation_info(process: HANDLE) -> Result<bool> {
-    unsafe {
-        let mut token = HandleWrapper::default();
-        OpenProcessToken(process, TOKEN_QUERY, token.get_handle_mut())?;
-        query_token_elevated(token.get_handle())
+fn parse_registered_path(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
     }
-}
-
-unsafe fn query_token_elevated(token: HANDLE) -> Result<bool> {
-    let mut ret_len = 0u32;
-    let mut elevation = TOKEN_ELEVATION::default();
-    GetTokenInformation(
-        token,
-        TokenElevation,
-        Some(&mut elevation as *mut _ as *mut _),
-        std::mem::size_of::<TOKEN_ELEVATION>() as u32,
-        &mut ret_len,
-    )?;
-
-    let mut elevation_type = TOKEN_ELEVATION_TYPE(0);
-    GetTokenInformation(
-        token,
-        TokenElevationType,
-        Some(&mut elevation_type as *mut _ as *mut _),
-        std::mem::size_of::<TOKEN_ELEVATION_TYPE>() as u32,
-        &mut ret_len,
-    )?;
-
-    let mut buf = [0u8; 512];
-    GetTokenInformation(
-        token,
-        TokenIntegrityLevel,
-        Some(buf.as_mut_ptr() as *mut _),
-        buf.len() as u32,
-        &mut ret_len,
-    )?;
-
-    let label = &*(buf.as_ptr() as *const TOKEN_MANDATORY_LABEL);
-    let sid = label.Label.Sid;
-    if sid.0.is_null() {
-        bail!("SID is null");
+    if let Some(rest) = value.strip_prefix('"') {
+        let end = rest.find('"')?;
+        return Some(rest[..end].to_string());
     }
-    let sub_auth_count = *GetSidSubAuthorityCount(sid);
-    let rid = *GetSidSubAuthority(sid, (sub_auth_count - 1).into());
-
-    Ok(matches!(
-        rid,
-        SECURITY_MANDATORY_HIGH_RID | SECURITY_MANDATORY_SYSTEM_RID
-    ) && elevation.TokenIsElevated != 0
-        && elevation_type == TokenElevationTypeFull)
+    Some(value.to_string())
 }
 
-/* ==========================================================================
- * Registry Fallback
- * ========================================================================== */
-
-struct RegKey {
-    hkey: HKEY,
-    name: PCWSTR,
+fn same_path(registered: &str, exe: &Path) -> bool {
+    let current = exe.to_string_lossy();
+    registered.trim().eq_ignore_ascii_case(current.as_ref())
 }
 
-impl RegKey {
-    fn new_hkcu(subkey: PCWSTR, name: PCWSTR) -> Result<RegKey> {
+fn approved_disabled(approved: Option<&[u8]>) -> Option<Option<String>> {
+    let bytes = approved?;
+    if !bytes.first().is_some_and(|byte| byte & 1 == 1) {
+        return None;
+    }
+    let filetime = if bytes.len() >= 12 {
+        u64::from_le_bytes([
+            bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11],
+        ])
+    } else {
+        0
+    };
+    Some(format_filetime(filetime))
+}
+
+fn evaluate(run: Option<&str>, approved: Option<&[u8]>, exe: &Path) -> AutoStartStatus {
+    let Some(value) = run else {
+        return AutoStartStatus::disabled("未注册开机启动项");
+    };
+    let Some(registered) = parse_registered_path(value) else {
+        return AutoStartStatus::disabled("开机启动项内容为空");
+    };
+    if !same_path(&registered, exe) {
+        return AutoStartStatus::blocked(
+            BlockReason::TargetMissing {
+                path: registered.clone(),
+            },
+            false,
+            format!(
+                "开机启动项指向 {}，与当前程序 {} 不一致",
+                registered,
+                exe.display()
+            ),
+        );
+    }
+    if let Some(since) = approved_disabled(approved) {
+        let detail = match &since {
+            Some(time) => format!("开机自启动已被系统禁用（{}）", time),
+            None => "开机自启动已被系统禁用".to_string(),
+        };
+        return AutoStartStatus::blocked(BlockReason::DisabledBySystem { since }, true, detail);
+    }
+    AutoStartStatus::enabled("开机自启动已启用")
+}
+
+fn format_filetime(filetime: u64) -> Option<String> {
+    const EPOCH_DIFF: u64 = 116_444_736_000_000_000;
+    if filetime == 0 || filetime < EPOCH_DIFF {
+        return None;
+    }
+    let seconds = (filetime - EPOCH_DIFF) / 10_000_000;
+    let days = (seconds / 86_400) as i64;
+    let remainder = seconds % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    Some(format!(
+        "{:04}-{:02}-{:02} {:02}:{:02} UTC",
+        year,
+        month,
+        day,
+        remainder / 3600,
+        (remainder % 3600) / 60
+    ))
+}
+
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
+trait RegistryBackend {
+    fn read_string(&self, key: &str, name: &str) -> Result<Option<String>>;
+    fn read_binary(&self, key: &str, name: &str) -> Result<Option<Vec<u8>>>;
+    fn write_string(&self, key: &str, name: &str, value: &str) -> Result<()>;
+    fn delete(&self, key: &str, name: &str) -> Result<()>;
+}
+
+struct WinRegistry;
+
+fn wide(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+impl WinRegistry {
+    fn open(key: &str, access: REG_SAM_FLAGS) -> Result<HKEY> {
+        let key_w = wide(key);
         let mut hkey = HKEY::default();
         unsafe {
             RegCreateKeyExW(
                 HKEY_CURRENT_USER,
-                subkey,
+                PCWSTR(key_w.as_ptr()),
                 0,
                 PCWSTR::null(),
                 REG_OPTION_NON_VOLATILE,
-                KEY_QUERY_VALUE | KEY_SET_VALUE,
+                access,
                 None,
-                &mut hkey as *mut _,
+                &mut hkey,
                 None,
             )
         }
         .ok()
-        .map_err(|err| anyhow!("Fail to open or create reg key, {:?}", err))?;
-        Ok(RegKey { hkey, name })
+        .map_err(|err| anyhow!("打开注册表项 {} 失败: {:?}", key, err))?;
+        Ok(hkey)
     }
 
-    fn get_value(&self) -> Result<Option<Vec<u16>>> {
-        let mut buffer = [0u16; 1024];
-        let mut size: u32 = (1024 * std::mem::size_of_val(&buffer[0])) as u32;
-        let mut kind: REG_VALUE_TYPE = Default::default();
-        let ret = unsafe {
+    fn query(hkey: HKEY, name: &str, flags: REG_ROUTINE_FLAGS) -> Result<Option<(REG_VALUE_TYPE, Vec<u8>)>> {
+        let name_w = wide(name);
+        let mut buffer = vec![0u8; 32 * 1024];
+        let mut size = buffer.len() as u32;
+        let mut kind = REG_VALUE_TYPE::default();
+        let result = unsafe {
             RegGetValueW(
-                self.hkey,
+                hkey,
                 None,
-                self.name,
-                RRF_RT_REG_SZ,
+                PCWSTR(name_w.as_ptr()),
+                flags,
                 Some(&mut kind),
                 Some(buffer.as_mut_ptr() as *mut _),
                 Some(&mut size),
             )
         };
-        if ret.is_err() {
-            if ret == ERROR_FILE_NOT_FOUND {
-                return Ok(None);
-            }
-            bail!(
-                "Fail to get reg value, {:?}",
-                windows::core::Error::from(ret)
-            );
+        if result == ERROR_FILE_NOT_FOUND {
+            return Ok(None);
         }
-        let len = (size as usize - 1) / 2; // size includes null terminator
-        Ok(Some(buffer[..len].to_vec()))
-    }
-
-    fn set_value(&self, value: &[u8]) -> Result<()> {
-        unsafe { RegSetValueExW(self.hkey, self.name, 0, REG_SZ, Some(value)) }
+        result
             .ok()
-            .map_err(|err| anyhow!("Fail to write reg value, {:?}", err))?;
-        Ok(())
+            .map_err(|err| anyhow!("读取注册表值 {} 失败: {:?}", name, err))?;
+        buffer.truncate(size as usize);
+        Ok(Some((kind, buffer)))
     }
+}
 
-    fn delete_value(&self) -> Result<()> {
-        let result = unsafe { RegDeleteValueW(self.hkey, self.name) };
-        if result != ERROR_FILE_NOT_FOUND {
-            result
-                .ok()
-                .map_err(|err| anyhow!("Failed to delete reg value, {:?}", err))?;
+impl RegistryBackend for WinRegistry {
+    fn read_string(&self, key: &str, name: &str) -> Result<Option<String>> {
+        let hkey = Self::open(key, KEY_QUERY_VALUE)?;
+        let result = Self::query(hkey, name, RRF_RT_REG_SZ);
+        let _ = unsafe { RegCloseKey(hkey) };
+        let Some((kind, bytes)) = result? else {
+            return Ok(None);
+        };
+        if kind != REG_SZ {
+            return Ok(None);
         }
-        Ok(())
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        let text = String::from_utf16_lossy(&units);
+        Ok(Some(text.trim_end_matches('\0').to_string()))
     }
-}
 
-impl Drop for RegKey {
-    fn drop(&mut self) {
-        let _ = unsafe { RegCloseKey(self.hkey) };
+    fn read_binary(&self, key: &str, name: &str) -> Result<Option<Vec<u8>>> {
+        let hkey = Self::open(key, KEY_QUERY_VALUE)?;
+        let result = Self::query(hkey, name, RRF_RT_REG_BINARY);
+        let _ = unsafe { RegCloseKey(hkey) };
+        Ok(result?.map(|(_, bytes)| bytes))
     }
-}
 
-fn reg_key() -> Result<RegKey> {
-    RegKey::new_hkcu(HKEY_RUN, HKEY_NAME)
-}
-
-fn reg_is_enable(exe_path: &[u16]) -> Result<bool> {
-    let key = reg_key()?;
-    let value = match key.get_value()? {
-        Some(value) => value,
-        None => return Ok(false),
-    };
-    let exe_path_no_null = if exe_path.last() == Some(&0) {
-        &exe_path[..exe_path.len() - 1]
-    } else {
-        exe_path
-    };
-    Ok(value == exe_path_no_null)
-}
-
-fn reg_enable(exe_path: &[u16]) -> Result<()> {
-    let key = reg_key()?;
-    let path = unsafe { exe_path.align_to::<u8>().1 };
-    key.set_value(path)?;
-    Ok(())
-}
-
-fn reg_disable() -> Result<()> {
-    let key = reg_key()?;
-    key.delete_value()?;
-    Ok(())
-}
-
-/* ==========================================================================
- * Scheduled Task (Admin)
- * ========================================================================== */
-
-fn create_scheduled_task(name: &str, exe_path: &str) -> Result<()> {
-    let task_xml_path = create_task_file(name, exe_path)?;
-    let output = Command::new("schtasks")
-        .creation_flags(CREATE_NO_WINDOW.0)
-        .args(["/create", "/tn", name, "/xml", &task_xml_path, "/f"])
-        .output()?;
-    if !output.status.success() {
-        bail!(
-            "Fail to create scheduled task, {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+    fn write_string(&self, key: &str, name: &str, value: &str) -> Result<()> {
+        let hkey = Self::open(key, KEY_QUERY_VALUE | KEY_SET_VALUE)?;
+        let name_w = wide(name);
+        let mut bytes: Vec<u8> = value
+            .encode_utf16()
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect();
+        bytes.extend_from_slice(&[0, 0]);
+        let result = unsafe {
+            RegSetValueExW(hkey, PCWSTR(name_w.as_ptr()), 0, REG_SZ, Some(&bytes))
+        };
+        let _ = unsafe { RegCloseKey(hkey) };
+        result
+            .ok()
+            .map_err(|err| anyhow!("写入注册表值 {} 失败: {:?}", name, err))
     }
-    let _ = fs::remove_file(&task_xml_path); // Cleanup temp xml
-    Ok(())
-}
 
-fn delete_scheduled_task(name: &str) -> Result<()> {
-    let output = Command::new("schtasks")
-        .creation_flags(CREATE_NO_WINDOW.0)
-        .args(["/delete", "/tn", name, "/f"])
-        .output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // It's possible the task doesn't exist, which is fine
-        if !stderr.contains("ERROR: The system cannot find the file specified") {
-            bail!("Fail to delete scheduled task, {stderr}");
+    fn delete(&self, key: &str, name: &str) -> Result<()> {
+        let hkey = Self::open(key, KEY_QUERY_VALUE | KEY_SET_VALUE)?;
+        let name_w = wide(name);
+        let result = unsafe { RegDeleteValueW(hkey, PCWSTR(name_w.as_ptr())) };
+        let _ = unsafe { RegCloseKey(hkey) };
+        if result == ERROR_FILE_NOT_FOUND {
+            return Ok(());
         }
+        result
+            .ok()
+            .map_err(|err| anyhow!("删除注册表值 {} 失败: {:?}", name, err))
     }
-    Ok(())
-}
-
-fn exist_scheduled_task(name: &str) -> Result<bool> {
-    let output = Command::new("schtasks")
-        .creation_flags(CREATE_NO_WINDOW.0)
-        .args(["/query", "/tn", name])
-        .output()?;
-    Ok(output.status.success())
-}
-
-fn create_task_file(name: &str, exe_path: &str) -> Result<String> {
-    let (author, user_id) = get_author_and_userid()?;
-    let current_time = get_current_time();
-    let command_path = exe_path.to_string();
-
-    let xml_data = format!(
-        r#"<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo>
-    <Date>{current_time}</Date>
-    <Author>{author}</Author>
-    <URI>\{name}</URI>
-  </RegistrationInfo>
-  <Triggers>
-    <LogonTrigger>
-      <StartBoundary>{current_time}</StartBoundary>
-      <Enabled>true</Enabled>
-    </LogonTrigger>
-  </Triggers>
-  <Principals>
-    <Principal id="Author">
-      <UserId>{user_id}</UserId>
-      <LogonType>InteractiveToken</LogonType>
-      <RunLevel>HighestAvailable</RunLevel>
-    </Principal>
-  </Principals>
-  <Settings>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
-    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
-    <StopIfGoingOnBatteries>true</StopIfGoingOnBatteries>
-    <AllowHardTerminate>true</AllowHardTerminate>
-    <StartWhenAvailable>false</StartWhenAvailable>
-    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
-    <IdleSettings>
-      <StopOnIdleEnd>true</StopOnIdleEnd>
-      <RestartOnIdle>false</RestartOnIdle>
-    </IdleSettings>
-    <AllowStartOnDemand>true</AllowStartOnDemand>
-    <Enabled>true</Enabled>
-    <Hidden>false</Hidden>
-    <RunOnlyIfIdle>false</RunOnlyIfIdle>
-    <WakeToRun>false</WakeToRun>
-    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-    <Priority>7</Priority>
-  </Settings>
-  <Actions Context="Author">
-    <Exec>
-      <Command>{command_path}</Command>
-    </Exec>
-  </Actions>
-</Task>"#
-    );
-    let xml_path = env::temp_dir().join(format!("{name}-task.xml"));
-    let xml_path_str = xml_path.display().to_string();
-    let mut xml_bytes = Vec::with_capacity((xml_data.len() + 1) * 2);
-    xml_bytes.extend_from_slice(&[0xFF, 0xFE]);
-    for unit in xml_data.encode_utf16() {
-        xml_bytes.extend_from_slice(&unit.to_le_bytes());
-    }
-    fs::write(&xml_path, xml_bytes)?;
-    Ok(xml_path_str)
-}
-
-fn get_author_and_userid() -> Result<(String, String)> {
-    let mut token_handle = HandleWrapper::default();
-    unsafe {
-        OpenProcessToken(
-            GetCurrentProcess(),
-            TOKEN_QUERY,
-            token_handle.get_handle_mut(),
-        )?
-    };
-
-    let mut token_info_length = 0;
-    if let Err(err) = unsafe {
-        GetTokenInformation(
-            token_handle.get_handle(),
-            TokenUser,
-            None,
-            0,
-            &mut token_info_length,
-        )
-    } {
-        if err.code() != ERROR_INSUFFICIENT_BUFFER.into() {
-            return Err(err.into());
-        }
-    }
-
-    let mut token_user = Vec::<u8>::with_capacity(token_info_length as usize);
-    unsafe {
-        GetTokenInformation(
-            token_handle.get_handle(),
-            TokenUser,
-            Some(token_user.as_mut_ptr() as *mut _),
-            token_info_length,
-            &mut token_info_length,
-        )?
-    };
-
-    let user_sid = unsafe { *(token_user.as_ptr() as *const TOKEN_USER) }
-        .User
-        .Sid;
-
-    let mut name = Vec::<u16>::with_capacity(256);
-    let mut name_len = 256;
-    let mut domain = Vec::<u16>::with_capacity(256);
-    let mut domain_len = 256;
-    let mut sid_name_use = SID_NAME_USE(0);
-
-    unsafe {
-        LookupAccountSidW(
-            None,
-            user_sid,
-            PWSTR(name.as_mut_ptr()),
-            &mut name_len,
-            PWSTR(domain.as_mut_ptr()),
-            &mut domain_len,
-            &mut sid_name_use,
-        )?
-    };
-
-    unsafe {
-        name.set_len(name_len as usize);
-        domain.set_len(domain_len as usize);
-    }
-
-    let username = OsString::from_wide(&name).to_string_lossy().into_owned();
-    let domainname = OsString::from_wide(&domain).to_string_lossy().into_owned();
-
-    let mut sid_string = PWSTR::null();
-    unsafe { ConvertSidToStringSidW(user_sid, &mut sid_string)? };
-
-    let sid_str = OsString::from_wide(unsafe { sid_string.as_wide() })
-        .to_string_lossy()
-        .into_owned();
-
-    Ok((format!("{domainname}\\{username}"), sid_str))
-}
-
-fn get_current_time() -> String {
-    let st = unsafe { GetLocalTime() };
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
-        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
-    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::AutoStart;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct MemoryRegistry {
+        data: Mutex<HashMap<(String, String), Vec<u8>>>,
+    }
+
+    impl RegistryBackend for MemoryRegistry {
+        fn read_string(&self, key: &str, name: &str) -> Result<Option<String>> {
+            let data = self.data.lock().unwrap();
+            Ok(data
+                .get(&(key.to_string(), name.to_string()))
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned()))
+        }
+
+        fn read_binary(&self, key: &str, name: &str) -> Result<Option<Vec<u8>>> {
+            let data = self.data.lock().unwrap();
+            Ok(data
+                .get(&(key.to_string(), name.to_string()))
+                .cloned())
+        }
+
+        fn write_string(&self, key: &str, name: &str, value: &str) -> Result<()> {
+            self.data
+                .lock()
+                .unwrap()
+                .insert((key.to_string(), name.to_string()), value.as_bytes().to_vec());
+            Ok(())
+        }
+
+        fn delete(&self, key: &str, name: &str) -> Result<()> {
+            self.data
+                .lock()
+                .unwrap()
+                .remove(&(key.to_string(), name.to_string()));
+            Ok(())
+        }
+    }
+
+    fn exe() -> PathBuf {
+        PathBuf::from("C:\\Apps\\ScreenHop\\screenhop.exe")
+    }
 
     #[test]
-    fn test_autostart_toggle() {
-        let autostart = WinAutoStart::new();
-        // 开启自启
-        autostart.set_enabled(true).expect("Failed to enable");
-        assert!(autostart.is_enabled(), "Autostart should be enabled");
-        // 关闭自启
-        autostart.set_enabled(false).expect("Failed to disable");
-        assert!(!autostart.is_enabled(), "Autostart should be disabled");
+    fn enabled_when_registered_and_not_blocked() {
+        let status = evaluate(Some("\"C:\\Apps\\ScreenHop\\screenhop.exe\""), None, &exe());
+        assert!(status.enabled);
+        assert!(status.blocked.is_none());
+    }
+
+    #[test]
+    fn disabled_when_startup_approved_blocked() {
+        let mut approved = vec![3, 0, 0, 0];
+        approved.extend_from_slice(&0u64.to_le_bytes());
+        let status = evaluate(Some("\"C:\\Apps\\ScreenHop\\screenhop.exe\""), Some(&approved), &exe());
+        assert!(!status.enabled);
+        assert!(status.requires_user_action);
+        assert!(matches!(
+            status.blocked,
+            Some(BlockReason::DisabledBySystem { .. })
+        ));
+    }
+
+    #[test]
+    fn blocked_when_registered_path_is_stale() {
+        let status = evaluate(Some("\"D:\\old\\screenhop.exe\""), None, &exe());
+        assert!(!status.enabled);
+        assert!(matches!(
+            status.blocked,
+            Some(BlockReason::TargetMissing { .. })
+        ));
+    }
+
+    #[test]
+    fn disabled_without_registry_value() {
+        let status = evaluate(None, None, &exe());
+        assert!(!status.enabled);
+        assert!(status.blocked.is_none());
+    }
+
+    #[test]
+    fn set_enabled_roundtrip_with_memory_backend() {
+        let autostart = WinAutoStart {
+            backend: Box::new(MemoryRegistry::default()),
+        };
+        let status = autostart.set_enabled(true).unwrap();
+        assert!(status.enabled);
+        assert!(autostart.is_enabled());
+
+        let status = autostart.set_enabled(false).unwrap();
+        assert!(!status.enabled);
+        assert!(!autostart.is_enabled());
+    }
+
+    #[test]
+    fn reconcile_reenables_after_system_block() {
+        let autostart = WinAutoStart {
+            backend: Box::new(MemoryRegistry::default()),
+        };
+        autostart
+            .backend
+            .write_string(
+                RUN_KEY,
+                VALUE_NAME,
+                &format!("\"{}\"", std::env::current_exe().unwrap().display()),
+            )
+            .unwrap();
+        autostart
+            .backend
+            .write_string(APPROVED_KEY, VALUE_NAME, "\u{3}")
+            .unwrap();
+        let status = autostart.reconcile(true).unwrap();
+        assert!(status.enabled);
+    }
+
+    #[test]
+    fn filetime_formats_known_date() {
+        let filetime = 133_000_000_000_000_000u64;
+        let text = format_filetime(filetime).unwrap();
+        assert_eq!(text, "2022-06-18 04:26 UTC");
     }
 }

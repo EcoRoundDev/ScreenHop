@@ -21,8 +21,28 @@ fn inner_main() -> Result<()> {
     };
 
     // 加载配置
-    let config = AppConfig::load().context("加载配置失败")?;
+    let mut config = AppConfig::load().context("加载配置失败")?;
     log::info!("配置已加载: {:?}", config);
+
+    // 启动时对齐系统自启动状态与配置
+    {
+        use screenhop_platform::AutoStart;
+        match screenhop_platform::auto_start().reconcile(config.auto_start) {
+            Ok(status) => {
+                log::info!("开机自启动状态: {}", status.detail);
+                if status.requires_user_action {
+                    log::warn!("开机自启动需要用户处理: {}", status.detail);
+                }
+                if config.auto_start != status.enabled {
+                    config.auto_start = status.enabled;
+                    if let Err(err) = config.save() {
+                        log::error!("保存配置失败: {}", err);
+                    }
+                }
+            }
+            Err(err) => log::error!("同步开机自启动失败: {:?}", err),
+        }
+    }
 
     // macOS: 检查权限 + 安装事件钩子 + 启动托盘
     #[cfg(target_os = "macos")]

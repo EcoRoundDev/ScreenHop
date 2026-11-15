@@ -50,7 +50,7 @@ tray-icon = "0.21.3"
 muda = "0.17.1"
 open = "5"
 tao = "0.34.5"
-slint = "1.15.1"
+slint = { version = "=1.15.1", features = ["unstable-winit-030"] }
 image = "0.24"
 imageproc = "0.26.0"
 
@@ -68,7 +68,7 @@ embed-resource = "2.4"
 name = "ScreenHop"
 identifier = "com.dongdong.screenhop"
 icon = ["assets/ScreenHop.icns"]
-version = "1.0.0"
+version = "1.1.4"
 copyright = "Copyright © dongdong"
 short_description = "A window moving tool"
 

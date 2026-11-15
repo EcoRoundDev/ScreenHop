@@ -152,13 +152,84 @@ pub trait MonitorManager {
     fn get_monitor_for_window(&self, handle: &WindowHandle) -> Option<MonitorInfo>;
 }
 
+/// 自启动被阻塞的原因
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockReason {
+    /// 被系统启动项管理器禁用
+    DisabledBySystem { since: Option<String> },
+    /// 注册项指向的程序已不存在或与当前程序不一致
+    TargetMissing { path: String },
+    /// 需要用户在系统设置中批准
+    NeedsApproval,
+    /// 平台不支持
+    Unsupported,
+    /// 权限不足
+    PermissionDenied,
+}
+
+/// 自启动真实状态
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoStartStatus {
+    pub enabled: bool,
+    pub requires_user_action: bool,
+    pub blocked: Option<BlockReason>,
+    pub detail: String,
+}
+
+impl AutoStartStatus {
+    pub fn enabled(detail: impl Into<String>) -> Self {
+        Self {
+            enabled: true,
+            requires_user_action: false,
+            blocked: None,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn disabled(detail: impl Into<String>) -> Self {
+        Self {
+            enabled: false,
+            requires_user_action: false,
+            blocked: None,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn blocked(
+        blocked: BlockReason,
+        requires_user_action: bool,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            enabled: false,
+            requires_user_action,
+            blocked: Some(blocked),
+            detail: detail.into(),
+        }
+    }
+}
+
 /// 开机自启动 trait
 pub trait AutoStart {
-    /// 是否已启用自启动
-    fn is_enabled(&self) -> bool;
+    /// 读取系统真实状态
+    fn status(&self) -> Result<AutoStartStatus>;
 
-    /// 设置自启动状态
-    fn set_enabled(&self, enabled: bool) -> Result<()>;
+    /// 设置自启动状态，返回设置后的真实状态
+    fn set_enabled(&self, enabled: bool) -> Result<AutoStartStatus>;
+
+    /// 将系统状态与期望值对齐
+    fn reconcile(&self, desired: bool) -> Result<AutoStartStatus> {
+        let current = self.status()?;
+        if current.enabled == desired && current.blocked.is_none() {
+            return Ok(current);
+        }
+        self.set_enabled(desired)
+    }
+
+    /// 是否已启用自启动
+    fn is_enabled(&self) -> bool {
+        self.status().map(|status| status.enabled).unwrap_or(false)
+    }
 }
 
 /// 权限检查 trait
@@ -186,4 +257,14 @@ pub fn create_platform() -> macos::MacPlatform {
 #[cfg(target_os = "windows")]
 pub fn create_platform() -> windows::WinPlatform {
     windows::WinPlatform::new()
+}
+
+#[cfg(target_os = "macos")]
+pub fn auto_start() -> macos::autostart::MacAutoStart {
+    macos::autostart::MacAutoStart::new()
+}
+
+#[cfg(target_os = "windows")]
+pub fn auto_start() -> windows::autostart::WinAutoStart {
+    windows::autostart::WinAutoStart::new()
 }

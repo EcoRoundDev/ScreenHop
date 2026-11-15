@@ -235,7 +235,7 @@ jobs:
           files: artifacts/**/*.zip
           name: Release ${{ steps.get_version.outputs.version }}
           body: |
-            ## Window Mover ${{ steps.get_version.outputs.version }}
+            ## ScreenHop ${{ steps.get_version.outputs.version }}
 
             ### 📥 下载选择 (Download Options)
 

@@ -966,7 +966,7 @@ pub fn run_app(config: AppConfig) -> Result<()> {
     let icon = create_tray_icon_image();
     let _tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip("Window Mover")
+        .with_tooltip("Screenhop")
         .with_icon(icon)
         .build()?;
 

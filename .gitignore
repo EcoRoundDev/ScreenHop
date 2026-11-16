@@ -20,3 +20,13 @@ ehthumbs.db
 Desktop.ini
 
 /.antigravity
+
+__pycache__/
+*.pyc
+*.p12
+*.pfx
+*.private-key.pem
+*.private-key.der
+*.keychain
+*.keychain-db
+/.macos-dev-signing/

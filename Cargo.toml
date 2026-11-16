@@ -21,6 +21,9 @@ repository.workspace = true
 name = "screenhop"
 path = "src/main.rs"
 
+[features]
+macos-dev = []
+
 [dependencies]
 # 平台抽象层
 screenhop-platform = { path = "crates/platform" }
@@ -66,10 +69,10 @@ embed-resource = "2.4"
 
 [package.metadata.bundle]
 name = "ScreenHop"
-identifier = "com.dongdong.screenhop"
+identifier = "com.ecorounddev.screenhop"
 icon = ["assets/ScreenHop.icns"]
 version = "1.1.4"
-copyright = "Copyright © dongdong"
+copyright = "Copyright © ecorounddev"
 short_description = "A window moving tool"
 
 [workspace.dependencies]

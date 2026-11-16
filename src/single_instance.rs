@@ -39,7 +39,7 @@ mod tests {
 
     fn test_app_id(name: &str) -> String {
         format!(
-            "com.dongdong.screenhop.test.{}.{}",
+            "com.ecorounddev.screenhop.test.{}.{}",
             std::process::id(),
             name
         )

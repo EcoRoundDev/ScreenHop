@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "configured": false,
+  "bundle_id": "com.ecorounddev.screenhop.dev",
+  "app_name": "ScreenHop Dev",
+  "certificate_kind": null,
+  "certificate_sha1": null,
+  "certificate_sha256": null,
+  "team_id": null,
+  "designated_requirement": null
+}

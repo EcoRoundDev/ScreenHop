@@ -1,0 +1,74 @@
+name: Build and Sign macOS Dev
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-sign-macos-dev:
+    if: github.event.repository.fork == false && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: macos-15
+    timeout-minutes: 90
+    environment:
+      name: macos-dev-signing
+    steps:
+      - name: Checkout exact triggering commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Verify configured signing policy before building
+        run: python3 scripts/macos-ci-signing.py preflight --policy ci/macos-dev-signing-policy.json
+
+      - name: Add Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Test macOS signing helpers with mocks
+        run: python3 -m unittest discover -s scripts -p "test_macos_*.py"
+
+      - name: Test macOS Dev feature
+        run: cargo test --workspace --features macos-dev
+
+      - name: Build both Dev binaries
+        run: |
+          cargo build --release --features macos-dev --target aarch64-apple-darwin --bin screenhop
+          cargo build --release --features macos-dev --target x86_64-apple-darwin --bin screenhop
+
+      - name: Assemble unsigned bundles
+        run: >-
+          python3 scripts/macos-ci-signing.py prepare
+          --policy ci/macos-dev-signing-policy.json
+          --arm64-binary target/aarch64-apple-darwin/release/screenhop
+          --x86-binary target/x86_64-apple-darwin/release/screenhop
+
+      - name: Import identity, sign final bundles, and verify policy
+        env:
+          MACOS_DEV_CERT_P12_BASE64: ${{ secrets.MACOS_DEV_CERT_P12_BASE64 }}
+          MACOS_DEV_CERT_PASSWORD: ${{ secrets.MACOS_DEV_CERT_PASSWORD }}
+        run: python3 scripts/macos-ci-signing.py sign --policy ci/macos-dev-signing-policy.json
+
+      - name: Remove temporary identity and trust settings
+        if: always()
+        run: python3 scripts/macos-ci-signing.py cleanup
+
+      - name: Archive and verify signed bundles
+        run: python3 scripts/macos-ci-signing.py archive --policy ci/macos-dev-signing-policy.json
+
+      - name: Upload only verified public artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ScreenHop-Dev-macOS-${{ github.sha }}-${{ github.run_id }}-attempt${{ github.run_attempt }}
+          path: |
+            artifacts/ScreenHop-Dev-macOS-arm64-*.zip
+            artifacts/ScreenHop-Dev-macOS-x86_64-*.zip
+            artifacts/ScreenHop-Dev-macOS-universal-*.zip
+            artifacts/SHA256SUMS
+            artifacts/signing-manifest.json
+          if-no-files-found: error
+          retention-days: 14

@@ -2,7 +2,28 @@ use anyhow::Result;
 use screenhop::config::AppConfig;
 use screenhop::monitor;
 use screenhop_platform::Point;
+#[cfg(target_os = "macos")]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+#[cfg(target_os = "macos")]
+static TITLE_BAR_HEIGHT: AtomicU64 = AtomicU64::new(40.0f64.to_bits());
+
+pub fn update_hook_config(config: &AppConfig) {
+    HOOK_ENABLED.store(!config.disable_hook, Ordering::SeqCst);
+    #[cfg(target_os = "macos")]
+    TITLE_BAR_HEIGHT.store(config.title_bar_height.to_bits(), Ordering::Relaxed);
+}
+
+#[cfg(target_os = "macos")]
+pub fn install_macos_hook(hook: &mut screenhop_platform::macos::hook::MacMouseHook) -> Result<()> {
+    hook.install_event_tap(|event| {
+        handle_middle_click(
+            event.point,
+            f64::from_bits(TITLE_BAR_HEIGHT.load(Ordering::Relaxed)),
+        )
+    })
+}
 
 /// 全局标志：钩子是否处于启用状态（true = 处理事件，false = 放行所有事件）
 static HOOK_ENABLED: AtomicBool = AtomicBool::new(true);
@@ -18,17 +39,11 @@ pub fn set_hook_enabled(enabled: bool) {
 }
 
 /// 安装鼠标中键钩子，注册事件处理逻辑
+#[cfg(target_os = "windows")]
 pub fn install_hook(config: &AppConfig) -> Result<()> {
     // 根据配置初始化全局启用状态
     HOOK_ENABLED.store(!config.disable_hook, Ordering::SeqCst);
     let title_bar_height = config.title_bar_height;
-
-    #[cfg(target_os = "macos")]
-    {
-        use screenhop_platform::macos::hook::MacMouseHook;
-        let mut hook = MacMouseHook::new();
-        hook.install_event_tap(move |event| handle_middle_click(event.point, title_bar_height))?;
-    }
 
     #[cfg(target_os = "windows")]
     {

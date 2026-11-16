@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const AGENT_LABEL: &str = "com.dongdong.screenhop";
+const AGENT_LABEL: &str = "com.ecorounddev.screenhop";
 
 pub struct MacAutoStart;
 

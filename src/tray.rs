@@ -16,6 +16,8 @@ const MENU_ID_PROXY_ENABLE: &str = "proxy_enable";
 const MENU_ID_PROXY_SETTINGS: &str = "proxy_settings";
 const MENU_ID_AUTO_CHECK_UPDATE: &str = "auto_check_update";
 const MENU_ID_QUIT: &str = "quit";
+#[cfg(target_os = "macos")]
+const MENU_ID_PERMISSIONS: &str = "permissions";
 
 const REPO_URL: &str = "https://github.com/EcoRoundDev/ScreenHop";
 
@@ -44,6 +46,9 @@ fn now_unix() -> i64 {
 }
 
 fn should_auto_check(cfg: &AppConfig) -> bool {
+    if screenhop::is_dev_build() {
+        return false;
+    }
     if cfg.test_update_version.is_some() {
         return true;
     }
@@ -59,6 +64,53 @@ fn should_auto_check(cfg: &AppConfig) -> bool {
 fn toast(window: &crate::slint_ui::MainWindow, text: &str) {
     window.set_toast_text(text.into());
     window.set_toast_visible(true);
+}
+
+fn current_autostart_status() -> Result<AutoStartStatus> {
+    if screenhop::is_dev_build() {
+        Ok(AutoStartStatus::disabled("开发版不启用开机自启动"))
+    } else {
+        screenhop_platform::auto_start().status()
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn permission_text(status: &crate::macos_runtime::HookStatus) -> (i32, &'static str, String) {
+    use crate::macos_runtime::HookState;
+    match status.state {
+        HookState::NeedsPermission => (0, "需要辅助功能权限", format!("需要辅助功能权限，才能监听中键并移动窗口。请在系统设置中开启 {}，授权后将自动生效。", screenhop::app_name())),
+        HookState::Paused => (1, "已暂停", "辅助功能权限已就绪，打开上方开关即可启用。".into()),
+        HookState::Starting => (2, "正在启动", "正在安装鼠标中键监听。".into()),
+        HookState::Running => (3, "中键移动运行中", "辅助功能权限已就绪。关闭开关可立即暂停。".into()),
+        HookState::Failed => (4, "启动失败", format!("{}。将有限重试；仍未恢复时，可重试或重新启动。", status.error.as_deref().unwrap_or("鼠标监听未能启动"))),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn apply_permission_status(
+    window: &crate::slint_ui::MainWindow,
+    status: &crate::macos_runtime::HookStatus,
+) {
+    let (state, text, detail) = permission_text(status);
+    window.set_permission_state(state);
+    window.set_permission_status(text.into());
+    window.set_permission_detail(detail.into());
+}
+
+#[cfg(target_os = "macos")]
+fn reconcile_permissions(
+    config: &Arc<Mutex<AppConfig>>,
+    items: &MenuItems,
+    force: bool,
+) -> Option<crate::macos_runtime::HookStatus> {
+    let cfg = config.lock().ok()?.clone();
+    let status = crate::macos_runtime::reconcile(&cfg, force);
+    items.status_item.set_text(format!(
+        "{}：{}",
+        screenhop::app_name(),
+        permission_text(&status).1
+    ));
+    Some(status)
 }
 
 fn autostart_detail(status: &AutoStartStatus) -> String {
@@ -114,7 +166,19 @@ fn protocol_to_scheme(proto: &str) -> &'static str {
 
 /// 在后台线程中执行更新检查和下载
 fn do_check_update(config: Arc<Mutex<AppConfig>>, manual: bool, startup: bool) {
-    let (version, proxy_url, proxy_username, proxy_password, mock_version, mock_url, skip_version, dark) = {
+    if screenhop::is_dev_build() {
+        return;
+    }
+    let (
+        version,
+        proxy_url,
+        proxy_username,
+        proxy_password,
+        mock_version,
+        mock_url,
+        skip_version,
+        dark,
+    ) = {
         let cfg = match config.lock() {
             Ok(cfg) => cfg,
             Err(_) => return,
@@ -156,7 +220,9 @@ fn do_check_update(config: Arc<Mutex<AppConfig>>, manual: bool, startup: bool) {
                 proxy_password.as_deref(),
                 mock_version.as_deref(),
                 mock_url.as_deref(),
-            ).await {
+            )
+            .await
+            {
                 Ok(result) => {
                     if let Some(err) = &result.error {
                         log::warn!("检查更新失败: {}", err);
@@ -185,10 +251,8 @@ fn do_check_update(config: Arc<Mutex<AppConfig>>, manual: bool, startup: bool) {
                             result.latest_version
                         );
 
-                        let prompt = format!(
-                            "发现新版本 {}，是否立即下载并安装？",
-                            result.latest_version
-                        );
+                        let prompt =
+                            format!("发现新版本 {}，是否立即下载并安装？", result.latest_version);
                         let should_update =
                             crate::slint_ui::confirm("发现更新", &prompt, true, "立即更新")
                                 .recv_timeout(std::time::Duration::from_secs(600))
@@ -231,59 +295,78 @@ fn do_check_update(config: Arc<Mutex<AppConfig>>, manual: bool, startup: bool) {
                                     crate::slint_ui::activate_window(&dialog.window());
 
                                     // 共享状态供后台线程和UI线程通讯 (progress, text, can_cancel, finished)
-                                    let progress_state = Arc::new(std::sync::Mutex::new((0.0f32, String::new(), true, false)));
+                                    let progress_state = Arc::new(std::sync::Mutex::new((
+                                        0.0f32,
+                                        String::new(),
+                                        true,
+                                        false,
+                                    )));
 
-                                    let timer_rc = Rc::new(RefCell::new(Some(slint::Timer::default())));
+                                    let timer_rc =
+                                        Rc::new(RefCell::new(Some(slint::Timer::default())));
                                     let timer_clone = timer_rc.clone();
 
                                     let progress_state_timer = progress_state.clone();
                                     let is_cancelled_timer = is_cancelled.clone();
                                     let d_weak_timer = dialog.as_weak();
 
-                                    timer_rc.borrow().as_ref().unwrap().start(slint::TimerMode::Repeated, std::time::Duration::from_millis(100), move || {
-                                        let mut finished = false;
-                                        let is_cancelled_now = is_cancelled_timer.load(Ordering::SeqCst);
+                                    timer_rc.borrow().as_ref().unwrap().start(
+                                        slint::TimerMode::Repeated,
+                                        std::time::Duration::from_millis(100),
+                                        move || {
+                                            let mut finished = false;
+                                            let is_cancelled_now =
+                                                is_cancelled_timer.load(Ordering::SeqCst);
 
-                                        match d_weak_timer.upgrade() { Some(d) => {
-                                            let (pct, text, can_cancel, is_done) = {
-                                                let state = progress_state_timer.lock().unwrap();
-                                                (state.0, state.1.clone(), state.2, state.3)
-                                            };
+                                            match d_weak_timer.upgrade() {
+                                                Some(d) => {
+                                                    let (pct, text, can_cancel, is_done) = {
+                                                        let state =
+                                                            progress_state_timer.lock().unwrap();
+                                                        (state.0, state.1.clone(), state.2, state.3)
+                                                    };
 
-                                            // 取消进行中时不覆盖 UI 文字（保持"正在取消..."）
-                                            if !is_cancelled_now && !text.is_empty() {
-                                                d.set_status_text(text.into());
-                                                d.set_progress(pct);
-                                                d.set_can_cancel(can_cancel);
-                                            }
+                                                    // 取消进行中时不覆盖 UI 文字（保持"正在取消..."）
+                                                    if !is_cancelled_now && !text.is_empty() {
+                                                        d.set_status_text(text.into());
+                                                        d.set_progress(pct);
+                                                        d.set_can_cancel(can_cancel);
+                                                    }
 
-                                            if is_done {
-                                                finished = true;
-                                                if is_cancelled_now {
-                                                    // 取消完成后直接隐藏对话框
-                                                    let _ = d.hide();
+                                                    if is_done {
+                                                        finished = true;
+                                                        if is_cancelled_now {
+                                                            // 取消完成后直接隐藏对话框
+                                                            let _ = d.hide();
+                                                        }
+                                                        // 非取消情况下（成功/失败），对话框保持显示
+                                                        // 让用户看到最终状态文字（如"应用更新失败"）
+                                                    }
                                                 }
-                                                // 非取消情况下（成功/失败），对话框保持显示
-                                                // 让用户看到最终状态文字（如"应用更新失败"）
+                                                _ => {
+                                                    finished = true;
+                                                }
                                             }
-                                        } _ => {
-                                            finished = true;
-                                        }}
 
-                                        if finished {
-                                            if let Ok(mut t) = timer_clone.try_borrow_mut() {
-                                                *t = None;
+                                            if finished {
+                                                if let Ok(mut t) = timer_clone.try_borrow_mut() {
+                                                    *t = None;
+                                                }
                                             }
-                                        }
-                                    });
+                                        },
+                                    );
 
                                     // 3. 在新线程中执行下载及解压
                                     let progress_state_thread = progress_state.clone();
                                     let is_cancelled_thread = is_cancelled.clone();
                                     std::thread::spawn(move || {
-                                        let rt2 = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                                        let rt2 = tokio::runtime::Builder::new_current_thread()
+                                            .enable_all()
+                                            .build()
+                                            .unwrap();
                                         rt2.block_on(async move {
-                                            let extract_dir = std::env::temp_dir().join("screenhop_update");
+                                            let extract_dir =
+                                                std::env::temp_dir().join("screenhop_update");
                                             let _ = std::fs::remove_dir_all(&extract_dir); // 清理旧缓存
                                             std::fs::create_dir_all(&extract_dir).unwrap();
 
@@ -292,11 +375,19 @@ fn do_check_update(config: Arc<Mutex<AppConfig>>, manual: bool, startup: bool) {
                                             // 定义进度回调
                                             let progress_state_cb = progress_state_thread.clone();
                                             let progress_cb = move |downloaded: u64, total: u64| {
-                                                let pct = if total > 0 { downloaded as f32 / total as f32 } else { 0.0 };
-                                                let mb_downloaded = downloaded as f32 / 1024.0 / 1024.0;
+                                                let pct = if total > 0 {
+                                                    downloaded as f32 / total as f32
+                                                } else {
+                                                    0.0
+                                                };
+                                                let mb_downloaded =
+                                                    downloaded as f32 / 1024.0 / 1024.0;
                                                 let mb_total = total as f32 / 1024.0 / 1024.0;
 
-                                                let text = format!("正在下载: {:.1} MB / {:.1} MB", mb_downloaded, mb_total);
+                                                let text = format!(
+                                                    "正在下载: {:.1} MB / {:.1} MB",
+                                                    mb_downloaded, mb_total
+                                                );
                                                 let mut state = progress_state_cb.lock().unwrap();
                                                 state.0 = pct;
                                                 state.1 = text;
@@ -309,12 +400,14 @@ fn do_check_update(config: Arc<Mutex<AppConfig>>, manual: bool, startup: bool) {
                                                 proxy_url_clone2.as_deref(),
                                                 proxy_username_clone2.as_deref(),
                                                 proxy_password_clone2.as_deref(),
-                                                progress_cb
-                                            ).await;
+                                                progress_cb,
+                                            )
+                                            .await;
 
                                             if is_cancelled_thread.load(Ordering::SeqCst) {
                                                 log::info!("用户已取消更新");
-                                                let mut state = progress_state_thread.lock().unwrap();
+                                                let mut state =
+                                                    progress_state_thread.lock().unwrap();
                                                 state.3 = true; // finish
                                                 return;
                                             }
@@ -323,33 +416,45 @@ fn do_check_update(config: Arc<Mutex<AppConfig>>, manual: bool, startup: bool) {
                                                 Ok(_) => {
                                                     // 4. 下载解压成功，执行应用替换逻辑
                                                     {
-                                                        let mut state = progress_state_thread.lock().unwrap();
-                                                        state.1 = "正在安装更新并重启...".to_string();
+                                                        let mut state =
+                                                            progress_state_thread.lock().unwrap();
+                                                        state.1 =
+                                                            "正在安装更新并重启...".to_string();
                                                         state.0 = 1.0;
                                                         state.2 = false;
                                                     }
 
                                                     // 应用更新
                                                     #[cfg(target_os = "macos")]
-                                                    let apply_res = screenhop::updater::apply_update_macos(&extract_dir);
+                                                    let apply_res =
+                                                        screenhop::updater::apply_update_macos(
+                                                            &extract_dir,
+                                                        );
 
                                                     #[cfg(target_os = "windows")]
-                                                    let apply_res = screenhop::updater::apply_update_windows(&extract_dir);
+                                                    let apply_res =
+                                                        screenhop::updater::apply_update_windows(
+                                                            &extract_dir,
+                                                        );
 
                                                     if let Err(e) = apply_res {
                                                         log::error!("应用更新失败: {:?}", e);
-                                                        let mut state = progress_state_thread.lock().unwrap();
+                                                        let mut state =
+                                                            progress_state_thread.lock().unwrap();
                                                         state.1 = format!("应用更新失败: {}", e);
                                                         state.2 = true;
                                                         state.3 = true;
                                                     } else {
-                                                        log::info!("更新应用成功，准备退出当前进程");
+                                                        log::info!(
+                                                            "更新应用成功，准备退出当前进程"
+                                                        );
                                                         std::process::exit(0);
                                                     }
-                                                },
+                                                }
                                                 Err(e) => {
                                                     log::error!("下载解压失败: {:?}", e);
-                                                    let mut state = progress_state_thread.lock().unwrap();
+                                                    let mut state =
+                                                        progress_state_thread.lock().unwrap();
                                                     state.1 = format!("下载失败: {}", e);
                                                     state.2 = true;
                                                     state.3 = true;
@@ -390,6 +495,8 @@ fn do_check_update(config: Arc<Mutex<AppConfig>>, manual: bool, startup: bool) {
 }
 
 struct MenuItems {
+    #[cfg(target_os = "macos")]
+    status_item: MenuItem,
     toggle_item: MenuItem,
     autostart_item: MenuItem,
     auto_check_update_item: MenuItem,
@@ -450,8 +557,10 @@ fn proxy_has_draft(
         || window.get_proxy_address().as_str() != address
         || window.get_proxy_port().as_str() != port
         || window.get_proxy_auth() != applied.proxy_username.is_some()
-        || window.get_proxy_username().as_str() != applied.proxy_username.clone().unwrap_or_default()
-        || window.get_proxy_password().as_str() != applied.proxy_password.clone().unwrap_or_default()
+        || window.get_proxy_username().as_str()
+            != applied.proxy_username.clone().unwrap_or_default()
+        || window.get_proxy_password().as_str()
+            != applied.proxy_password.clone().unwrap_or_default()
 }
 
 fn proxy_changed_externally(
@@ -496,9 +605,9 @@ fn refresh_settings_window(
     let proxy_enabled_same = previous
         .as_ref()
         .map_or(false, |p| p.proxy_enabled == snapshot.proxy_enabled);
-    let proxy_auth_same = previous
-        .as_ref()
-        .map_or(false, |p| p.proxy_username.is_some() == snapshot.proxy_username.is_some());
+    let proxy_auth_same = previous.as_ref().map_or(false, |p| {
+        p.proxy_username.is_some() == snapshot.proxy_username.is_some()
+    });
     let proxy_username_same = previous
         .as_ref()
         .map_or(false, |p| p.proxy_username == snapshot.proxy_username);
@@ -508,9 +617,9 @@ fn refresh_settings_window(
     let proxy_url_same = previous
         .as_ref()
         .map_or(false, |p| p.proxy_url == snapshot.proxy_url);
-    let last_check_same = previous
-        .as_ref()
-        .map_or(false, |p| p.last_update_check_ts == snapshot.last_update_check_ts);
+    let last_check_same = previous.as_ref().map_or(false, |p| {
+        p.last_update_check_ts == snapshot.last_update_check_ts
+    });
 
     let apply_started = std::time::Instant::now();
     if stale(theme_same) {
@@ -518,6 +627,9 @@ fn refresh_settings_window(
     }
     if full {
         window.set_version_text(env!("CARGO_PKG_VERSION").into());
+        window.set_app_name(screenhop::app_name().into());
+        window.set_dev_build(screenhop::is_dev_build());
+        window.set_macos_permissions(cfg!(target_os = "macos"));
         window.set_log_path(std::env::temp_dir().to_string_lossy().to_string().into());
     }
     if stale(hook_same) {
@@ -565,10 +677,17 @@ fn refresh_settings_window(
             None => "尚未检查更新".into(),
         });
     }
+    #[cfg(target_os = "macos")]
+    {
+        apply_permission_status(window, &crate::macos_runtime::status());
+        if let Ok(path) = crate::macos_permissions::application_path() {
+            window.set_application_path(path.to_string_lossy().as_ref().into());
+        }
+    }
     let apply_elapsed = apply_started.elapsed();
 
     let autostart_started = std::time::Instant::now();
-    match screenhop_platform::auto_start().status() {
+    match current_autostart_status() {
         Ok(status) => {
             window.set_autostart_enabled(status.enabled);
             window.set_autostart_blocked(autostart_blocked(&status));
@@ -619,14 +738,60 @@ fn ensure_system_theme(config: &Arc<Mutex<AppConfig>>) {
     crate::slint_ui::refresh_system_dark(|_| {});
 }
 
+#[cfg(target_os = "macos")]
+fn bind_permission_controls(
+    window: &crate::slint_ui::MainWindow,
+    config: &Arc<Mutex<AppConfig>>,
+    items: &Rc<MenuItems>,
+) {
+    let weak = window.as_weak();
+    let config_clone = config.clone();
+    let items_clone = items.clone();
+    window.on_authorize(move || {
+        crate::macos_permissions::authorize();
+        if let Some(status) = reconcile_permissions(&config_clone, &items_clone, true) {
+            if let Some(window) = weak.upgrade() {
+                apply_permission_status(&window, &status);
+            }
+        }
+    });
+    let weak = window.as_weak();
+    let config_clone = config.clone();
+    let items_clone = items.clone();
+    window.on_recheck_permission(move || {
+        if let Some(status) = reconcile_permissions(&config_clone, &items_clone, true) {
+            if let Some(window) = weak.upgrade() {
+                apply_permission_status(&window, &status);
+            }
+        }
+    });
+    window.on_reveal_application(|| {
+        if let Err(error) = crate::macos_permissions::reveal_application() {
+            crate::slint_ui::show_error("当前应用位置", &format!("{error:#}"));
+        }
+    });
+    window.on_restart_application(|| {
+        if let Err(error) = crate::macos_permissions::restart() {
+            crate::slint_ui::show_error("重新启动失败", &format!("{error:#}"));
+        }
+    });
+    window.on_permission_help(|| {
+        let path = crate::macos_permissions::application_path().map(|path| path.display().to_string()).unwrap_or_else(|_| "未知位置".into());
+        crate::slint_ui::show_alert("辅助功能权限", &format!("打开 系统设置 → 隐私与安全性 → 辅助功能，开启 {}。授权后会自动生效，也可点击「重新检测」。如列表中有多个同名应用，请通过「在 Finder 中显示」核对当前副本。\n\n当前位置：{path}\n\n已授权仍启动失败时可重试；系统未向当前进程更新授权时，可重新启动应用。", screenhop::app_name()));
+    });
+}
+
 fn create_settings_window(
     config: &Arc<Mutex<AppConfig>>,
     items: &Rc<MenuItems>,
     dark: bool,
 ) -> Option<crate::slint_ui::MainWindow> {
     let window = crate::slint_ui::MainWindow::new().ok()?;
+    crate::slint_ui::apply_theme_main(&window, dark);
     crate::slint_ui::bind_main_window(&window);
     refresh_settings_window(&window, config, dark);
+    #[cfg(target_os = "macos")]
+    bind_permission_controls(&window, config, items);
 
     let weak = window.as_weak();
     window.on_close_requested(move || {
@@ -661,7 +826,18 @@ fn create_settings_window(
             }
         }
         if let Some(window) = weak.upgrade() {
-            toast(&window, if enabled { "已启用" } else { "已禁用" });
+            #[cfg(target_os = "macos")]
+            if let Some(status) = reconcile_permissions(&config_clone, &items_clone, false) {
+                apply_permission_status(&window, &status);
+            }
+            toast(
+                &window,
+                if enabled {
+                    "已开启，将按权限状态启动"
+                } else {
+                    "已暂停"
+                },
+            );
         }
     });
 
@@ -683,6 +859,9 @@ fn create_settings_window(
     let config_clone = config.clone();
     let items_clone = items.clone();
     window.on_autostart_toggled(move |enabled| {
+        if screenhop::is_dev_build() {
+            return;
+        }
         let auto = screenhop_platform::auto_start();
         match auto.set_enabled(enabled) {
             Ok(status) => {
@@ -723,6 +902,9 @@ fn create_settings_window(
     let config_clone = config.clone();
     let items_clone = items.clone();
     window.on_fix_autostart(move || {
+        if screenhop::is_dev_build() {
+            return;
+        }
         let auto = screenhop_platform::auto_start();
         match auto.set_enabled(true) {
             Ok(status) => {
@@ -824,6 +1006,9 @@ fn create_settings_window(
     let config_clone = config.clone();
     let items_clone = items.clone();
     window.on_auto_check_toggled(move |enabled| {
+        if screenhop::is_dev_build() {
+            return;
+        }
         if let Ok(mut cfg) = config_clone.lock() {
             cfg.auto_check_update = enabled;
             items_clone.auto_check_update_item.set_text(if enabled {
@@ -840,6 +1025,9 @@ fn create_settings_window(
     let weak = window.as_weak();
     let config_clone = config.clone();
     window.on_check_now(move || {
+        if screenhop::is_dev_build() {
+            return;
+        }
         if let Some(window) = weak.upgrade() {
             window.set_check_busy(true);
             toast(&window, "正在检查更新…");
@@ -876,7 +1064,21 @@ pub fn run_app(config: AppConfig) -> Result<()> {
     // 创建菜单
     let menu = Menu::new();
 
-    let status_item = MenuItem::new("ScreenHop is Running", false, None);
+    let status_item = MenuItem::new(
+        format!(
+            "{}：{}",
+            screenhop::app_name(),
+            if cfg!(target_os = "macos") {
+                "正在启动"
+            } else {
+                "已启动"
+            }
+        ),
+        false,
+        None,
+    );
+    #[cfg(target_os = "macos")]
+    let permissions_item = MenuItem::with_id(MENU_ID_PERMISSIONS, "权限设置…", true, None);
     let toggle_item = MenuItem::with_id(
         MENU_ID_TOGGLE,
         if config.lock().unwrap().disable_hook {
@@ -888,7 +1090,7 @@ pub fn run_app(config: AppConfig) -> Result<()> {
         None,
     );
     let settings_item = MenuItem::with_id(MENU_ID_SETTINGS, "设置...", true, None);
-    let autostart_status = match screenhop_platform::auto_start().status() {
+    let autostart_status = match current_autostart_status() {
         Ok(status) => {
             if let Ok(mut cfg) = config.lock() {
                 if cfg.auto_start != status.enabled {
@@ -955,6 +1157,13 @@ pub fn run_app(config: AppConfig) -> Result<()> {
     menu.append(&separator).ok();
     menu.append(&toggle_item).ok();
     menu.append(&settings_item).ok();
+    #[cfg(target_os = "macos")]
+    menu.append(&permissions_item).ok();
+    if screenhop::is_dev_build() {
+        autostart_item.set_enabled(false);
+        update_item.set_enabled(false);
+        auto_check_update_item.set_enabled(false);
+    }
     menu.append(&autostart_item).ok();
     menu.append(&update_item).ok();
     menu.append(&auto_check_update_item).ok();
@@ -966,7 +1175,7 @@ pub fn run_app(config: AppConfig) -> Result<()> {
     let icon = create_tray_icon_image();
     let _tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip("Screenhop")
+        .with_tooltip(screenhop::app_name())
         .with_icon(icon)
         .build()?;
 
@@ -988,6 +1197,8 @@ pub fn run_app(config: AppConfig) -> Result<()> {
 
     // 在主线程处理 Slint 和 MenuEvents
     let menu_items = Rc::new(MenuItems {
+        #[cfg(target_os = "macos")]
+        status_item,
         toggle_item,
         autostart_item,
         auto_check_update_item,
@@ -1001,6 +1212,37 @@ pub fn run_app(config: AppConfig) -> Result<()> {
 
     #[cfg(target_os = "macos")]
     let mut macos_policy_set = false;
+
+    #[cfg(target_os = "macos")]
+    let permission_timer = {
+        let timer = slint::Timer::default();
+        let config = config.clone();
+        let items = menu_items.clone();
+        let settings = settings_window.clone();
+        let mut previous = None;
+        let mut initialized = false;
+        timer.start(
+            slint::TimerMode::Repeated,
+            std::time::Duration::from_millis(250),
+            move || {
+                if let Some(status) = reconcile_permissions(&config, &items, false) {
+                    if !initialized {
+                        initialized = true;
+                        if status.state == crate::macos_runtime::HookState::NeedsPermission {
+                            handle_menu_event(MENU_ID_SETTINGS, &items, &config, &settings);
+                        }
+                    }
+                    if previous.as_ref() != Some(&status) {
+                        if let Some(window) = settings.borrow().as_ref() {
+                            apply_permission_status(window, &status);
+                        }
+                        previous = Some(status);
+                    }
+                }
+            },
+        );
+        timer
+    };
 
     // 定时检查 Menu事件
     let timer = slint::Timer::default();
@@ -1047,7 +1289,8 @@ pub fn run_app(config: AppConfig) -> Result<()> {
 
             while let Ok(event) = MenuEvent::receiver().try_recv() {
                 if event.id.0 == MENU_ID_QUIT {
-                    std::process::exit(0);
+                    let _ = slint::quit_event_loop();
+                    return;
                 }
                 handle_menu_event(
                     &event.id.0,
@@ -1058,7 +1301,14 @@ pub fn run_app(config: AppConfig) -> Result<()> {
             }
         },
     );
-    slint::run_event_loop_until_quit()?;
+    let result = slint::run_event_loop_until_quit();
+    timer.stop();
+    #[cfg(target_os = "macos")]
+    {
+        permission_timer.stop();
+        crate::macos_runtime::shutdown();
+    }
+    result?;
     Ok(())
 }
 
@@ -1093,9 +1343,20 @@ fn handle_menu_event(
                     log::error!("保存配置失败: {}", e);
                 }
             }
+            #[cfg(target_os = "macos")]
+            let _ = reconcile_permissions(config, items, false);
             sync_settings_window(settings, config);
         }
+        #[cfg(target_os = "macos")]
+        MENU_ID_PERMISSIONS => {
+            handle_menu_event(MENU_ID_SETTINGS, items, config, settings);
+            if let Some(window) = settings.borrow().as_ref() {
+                window.set_page(0);
+            }
+        }
         MENU_ID_SETTINGS => {
+            #[cfg(target_os = "macos")]
+            let _ = reconcile_permissions(config, items, true);
             let started = std::time::Instant::now();
             let dark = config
                 .lock()
@@ -1120,6 +1381,9 @@ fn handle_menu_event(
             log::info!("设置菜单处理耗时 {:?}", started.elapsed());
         }
         MENU_ID_AUTOSTART => {
+            if screenhop::is_dev_build() {
+                return;
+            }
             let desired = match config.lock() {
                 Ok(cfg) => !cfg.auto_start,
                 Err(_) => false,
@@ -1141,10 +1405,7 @@ fn handle_menu_event(
                 }
                 Err(err) => {
                     log::error!("设置开机自启动失败: {:?}", err);
-                    crate::slint_ui::show_error(
-                        "设置开机自启动失败",
-                        &format!("{err}"),
-                    );
+                    crate::slint_ui::show_error("设置开机自启动失败", &format!("{err}"));
                 }
             }
             sync_settings_window(settings, config);
@@ -1155,6 +1416,9 @@ fn handle_menu_event(
             do_check_update(config.clone(), true, false);
         }
         MENU_ID_AUTO_CHECK_UPDATE => {
+            if screenhop::is_dev_build() {
+                return;
+            }
             if let Ok(mut cfg) = config.lock() {
                 cfg.auto_check_update = !cfg.auto_check_update;
                 log::info!("启动时检查更新: {}", cfg.auto_check_update);

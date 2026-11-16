@@ -89,7 +89,7 @@ impl Default for AppConfig {
             disable_hook: false,
             auto_start: false,
             start_minimized: false,
-            auto_check_update: true,
+            auto_check_update: !crate::is_dev_build(),
             title_bar_height: default_title_bar_height(),
             proxy_enabled: false,
             proxy_url: String::new(),
@@ -109,9 +109,14 @@ impl AppConfig {
     /// - macOS: ~/Library/Application Support/screenhop/config.toml
     /// - Windows: %APPDATA%/screenhop/config.toml
     pub fn config_path() -> Result<PathBuf> {
-        let config_dir = dirs::config_dir()
-            .context("无法获取配置目录")?
-            .join("screenhop");
+        let config_dir =
+            dirs::config_dir()
+                .context("无法获取配置目录")?
+                .join(if crate::is_dev_build() {
+                    "screenhop-dev"
+                } else {
+                    "screenhop"
+                });
 
         fs::create_dir_all(&config_dir).context("无法创建配置目录")?;
 
@@ -138,6 +143,11 @@ impl AppConfig {
         {
             config.test_update_version = None;
             config.test_update_url = None;
+        }
+
+        if crate::is_dev_build() {
+            config.auto_start = false;
+            config.auto_check_update = false;
         }
 
         Ok(config)
@@ -167,7 +177,7 @@ mod tests {
         assert!(!config.disable_hook);
         assert!(!config.auto_start);
         assert!(!config.start_minimized);
-        assert!(config.auto_check_update);
+        assert_eq!(config.auto_check_update, !crate::is_dev_build());
         assert_eq!(config.title_bar_height, 40.0);
         assert!(!config.proxy_enabled);
         assert!(config.proxy_url.is_empty());

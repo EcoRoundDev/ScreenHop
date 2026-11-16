@@ -4,9 +4,10 @@ use std::sync::mpsc::Receiver;
 use slint::ComponentHandle;
 
 slint::slint! {
+    import { ScrollView } from "std-widgets.slint";
     export global Theme {
         in-out property <bool> dark: false;
-        in-out property <string> font-family: "Microsoft YaHei UI";
+        in-out property <string> font-family: "";
 
         out property <color> bg: dark ? #1C1C1E : #FFFFFF;
         out property <color> surface: dark ? #2C2C2E : #F5F5F7;
@@ -504,7 +505,6 @@ slint::slint! {
         background: Theme.bg;
         default-font-family: Theme.font-family;
 
-        in-out property <string> text_font: "Microsoft YaHei UI";
         in-out property <string> status_text: "正在准备更新…";
         in-out property <float> progress: 0;
         in-out property <bool> can_cancel: true;
@@ -555,7 +555,6 @@ slint::slint! {
         background: Theme.bg;
         default-font-family: Theme.font-family;
 
-        in-out property <string> text_font: "Microsoft YaHei UI";
         in-out property <string> address: "127.0.0.1";
         in-out property <string> port: "2888";
         in-out property <string> protocol: "SOCKS5";
@@ -676,7 +675,7 @@ slint::slint! {
     }
 
     export component MainWindow inherits Window {
-        title: "ScreenHop 设置";
+        title: root.app-name + " 设置";
         width: 880px;
         height: 620px;
         no-frame: true;
@@ -692,6 +691,13 @@ slint::slint! {
         in-out property <string> autostart-detail: "";
         in-out property <bool> autostart-blocked: false;
         in-out property <bool> hook-restart-hint: false;
+        in property <bool> macos-permissions: false;
+        in property <bool> dev-build: false;
+        in property <string> app-name: "ScreenHop";
+        in property <int> permission-state: 0;
+        in property <string> permission-status: "正在检测权限";
+        in property <string> permission-detail: "";
+        in property <string> application-path: "";
 
         in-out property <bool> proxy-enabled: false;
         in-out property <string> proxy-protocol: "SOCKS5";
@@ -715,6 +721,11 @@ slint::slint! {
         callback close-requested();
         callback minimize-requested();
         callback hook-toggled(bool);
+        callback authorize();
+        callback recheck-permission();
+        callback reveal-application();
+        callback restart-application();
+        callback permission-help();
         callback title-height-changed(float);
         callback autostart-toggled(bool);
         callback fix-autostart();
@@ -728,7 +739,7 @@ slint::slint! {
         VerticalLayout {
 
             AppTitleBar {
-                title: "ScreenHop 设置";
+                title: root.app-name + " 设置";
                 close => { root.close-requested(); }
                 minimize => { root.minimize-requested(); }
                 drag-request => { root.drag-request(); }
@@ -751,7 +762,7 @@ slint::slint! {
                         Rectangle { vertical-stretch: 1; }
 
                         Text {
-                            text: "ScreenHop " + root.version-text;
+                            text: root.app-name + " " + root.version-text;
                             color: Theme.text-secondary;
                             font-size: Theme.font-xs;
                             vertical-alignment: center;
@@ -763,7 +774,9 @@ slint::slint! {
                     background: Theme.bg;
                     horizontal-stretch: 1;
 
-                    if root.page == 0 : VerticalLayout {
+                    if root.page == 0 : ScrollView {
+                        VerticalLayout {
+                        alignment: start;
                         padding: 24px;
                         spacing: 16px;
 
@@ -788,6 +801,59 @@ slint::slint! {
                                 AppToggle {
                                     checked: root.hook-enabled;
                                     toggled(value) => { root.hook-enabled = value; root.hook-toggled(value); }
+                                }
+                            }
+                            if root.macos-permissions : VerticalLayout {
+                                spacing: 8px;
+                                Text {
+                                    text: root.permission-status;
+                                    color: root.permission-state == 0 || root.permission-state == 4 ? Theme.danger : Theme.text;
+                                    font-size: Theme.font-md;
+                                    font-weight: 600;
+                                }
+                                Text {
+                                    text: root.permission-detail;
+                                    color: Theme.text-secondary;
+                                    font-size: Theme.font-sm;
+                                    wrap: word-wrap;
+                                }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    alignment: start;
+                                    if root.permission-state == 0 : AppButton {
+                                        text: "前往授权";
+                                        kind: ButtonKind.primary;
+                                        clicked => { root.authorize(); }
+                                    }
+                                    AppButton {
+                                        text: root.permission-state == 4 ? "重试" : "重新检测";
+                                        clicked => { root.recheck-permission(); }
+                                    }
+                                    AppButton {
+                                        text: "权限帮助";
+                                        kind: ButtonKind.ghost;
+                                        clicked => { root.permission-help(); }
+                                    }
+                                    if root.permission-state == 0 || root.permission-state == 4 : AppButton {
+                                        text: "重新启动";
+                                        clicked => { root.restart-application(); }
+                                    }
+                                }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Text {
+                                        text: root.application-path;
+                                        color: Theme.text-secondary;
+                                        font-size: Theme.font-xs;
+                                        overflow: elide;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                    }
+                                    AppButton {
+                                        text: "在 Finder 中显示";
+                                        kind: ButtonKind.ghost;
+                                        clicked => { root.reveal-application(); }
+                                    }
                                 }
                             }
                             Text {
@@ -848,6 +914,7 @@ slint::slint! {
                                     clicked => { root.fix-autostart(); }
                                 }
                                 AppToggle {
+                                    enabled: !root.dev-build;
                                     checked: root.autostart-enabled;
                                     toggled(value) => { root.autostart-enabled = value; root.autostart-toggled(value); }
                                 }
@@ -861,6 +928,8 @@ slint::slint! {
                         }
 
                         Rectangle { vertical-stretch: 1; }
+                    }
+
                     }
 
                     if root.page == 1 : VerticalLayout {
@@ -1012,6 +1081,7 @@ slint::slint! {
                                     horizontal-stretch: 1;
                                 }
                                 AppToggle {
+                                    enabled: !root.dev-build;
                                     checked: root.auto-check;
                                     toggled(value) => { root.auto-check = value; root.auto-check-toggled(value); }
                                 }
@@ -1027,7 +1097,8 @@ slint::slint! {
                             HorizontalLayout {
                                 alignment: end;
                                 AppButton {
-                                    text: "立即检查";
+                                    text: root.dev-build ? "开发版不检查更新" : "立即检查";
+                                    enabled: !root.dev-build;
                                     kind: ButtonKind.primary;
                                     busy: root.check-busy;
                                     clicked => { root.check-now(); }
@@ -1211,28 +1282,44 @@ pub fn effective_dark(theme: screenhop::config::Theme) -> bool {
     }
 }
 
+pub fn platform_font_family() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        "Microsoft YaHei UI"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "Hiragino Sans GB"
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        ""
+    }
+}
+
 fn set_theme(theme: Theme, dark: bool) {
     theme.set_dark(dark);
-    #[cfg(target_os = "windows")]
-    theme.set_font_family(slint::SharedString::from("Microsoft YaHei UI"));
-    #[cfg(target_os = "macos")]
-    theme.set_font_family(slint::SharedString::from("PingFang SC"));
+}
+
+fn initialize_window_style(theme: Theme, dark: bool) {
+    theme.set_font_family(slint::SharedString::from(platform_font_family()));
+    set_theme(theme, dark);
 }
 
 pub fn apply_theme_main(handle: &MainWindow, dark: bool) {
-    set_theme(handle.global::<Theme>(), dark);
+    initialize_window_style(handle.global::<Theme>(), dark);
 }
 
 pub fn apply_theme_alert(handle: &AlertDialog, dark: bool) {
-    set_theme(handle.global::<Theme>(), dark);
+    initialize_window_style(handle.global::<Theme>(), dark);
 }
 
 pub fn apply_theme_progress(handle: &UpdateProgressDialog, dark: bool) {
-    set_theme(handle.global::<Theme>(), dark);
+    initialize_window_style(handle.global::<Theme>(), dark);
 }
 
 pub fn apply_theme_proxy(handle: &ProxyAuthDialog, dark: bool) {
-    set_theme(handle.global::<Theme>(), dark);
+    initialize_window_style(handle.global::<Theme>(), dark);
 }
 
 pub fn activate_window(window: &slint::Window) {
@@ -1246,12 +1333,13 @@ pub fn activate_window(window: &slint::Window) {
     }
 
     use slint::winit_030::WinitWindowAccessor;
-    let handled = window.with_winit_window(|winit_window: &slint::winit_030::winit::window::Window| {
-        if winit_window.is_minimized().unwrap_or(false) {
-            winit_window.set_minimized(false);
-        }
-        winit_window.focus_window();
-    });
+    let handled =
+        window.with_winit_window(|winit_window: &slint::winit_030::winit::window::Window| {
+            if winit_window.is_minimized().unwrap_or(false) {
+                winit_window.set_minimized(false);
+            }
+            winit_window.focus_window();
+        });
     if handled.is_none() {
         log::debug!("窗口尚未由 winit 后端创建，跳过系统激活");
     }
@@ -1356,9 +1444,10 @@ pub fn bind_main_window(window: &MainWindow) {
 
 pub fn request_system_drag(window: &slint::Window) {
     use slint::winit_030::WinitWindowAccessor;
-    let started = window.with_winit_window(|winit_window: &slint::winit_030::winit::window::Window| {
-        winit_window.drag_window()
-    });
+    let started =
+        window.with_winit_window(|winit_window: &slint::winit_030::winit::window::Window| {
+            winit_window.drag_window()
+        });
     match started {
         Some(Ok(())) => {}
         Some(Err(err)) => log::warn!("系统拖动启动失败: {err}"),

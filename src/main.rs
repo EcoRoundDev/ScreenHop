@@ -2,6 +2,10 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod app;
+#[cfg(target_os = "macos")]
+mod macos_permissions;
+#[cfg(target_os = "macos")]
+mod macos_runtime;
 mod single_instance;
 mod slint_ui;
 mod tray;
@@ -9,12 +13,12 @@ mod tray;
 use anyhow::{Context, Result};
 use screenhop::config::AppConfig;
 
-const APP_ID: &str = "com.dongdong.screenhop";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn inner_main() -> Result<()> {
     // 单实例检测
-    let Some(_instance_lock) = single_instance::try_lock(APP_ID).context("单实例检测失败")?
+    let Some(_instance_lock) =
+        single_instance::try_lock(screenhop::app_id()).context("单实例检测失败")?
     else {
         log::warn!("程序已在运行中，退出");
         return Ok(());
@@ -24,8 +28,7 @@ fn inner_main() -> Result<()> {
     let mut config = AppConfig::load().context("加载配置失败")?;
     log::info!("配置已加载: {:?}", config);
 
-    // 启动时对齐系统自启动状态与配置
-    {
+    if !screenhop::is_dev_build() {
         use screenhop_platform::AutoStart;
         match screenhop_platform::auto_start().reconcile(config.auto_start) {
             Ok(status) => {
@@ -44,49 +47,10 @@ fn inner_main() -> Result<()> {
         }
     }
 
-    // macOS: 检查权限 + 安装事件钩子 + 启动托盘
     #[cfg(target_os = "macos")]
     {
-        let platform = screenhop_platform::create_platform();
-
-        let has_perm = platform.check_accessibility_permissions();
-        if !has_perm {
-            log::warn!("缺少辅助功能权限，正在触发系统授权提示...");
-            // 触发 macOS 系统权限请求对话框
-            platform.request_accessibility_permissions();
-
-            // 为了防止系统自带弹窗没弹出来（macOS 经常吞弹窗），加上我们自己的弹窗引导
-            let script = r#"
-                display alert "ScreenHop 需要「辅助功能」权限" message "ScreenHop 需要该权限来监听鼠标中键移动窗口。\n\n请在随后的系统设置中，找到并勾选 ScreenHop。" buttons {"前往授权", "稍后"} default button 1
-                if button returned of result is "前往授权" then
-                    tell application "System Settings"
-                        activate
-                        reveal anchor "Privacy_Accessibility" of pane id "com.apple.settings.PrivacySecurity.extension"
-                    end tell
-                    
-                    -- Fallback for older macOS versions
-                    tell application "System Preferences"
-                        activate
-                        reveal anchor "Privacy_Accessibility" of pane id "com.apple.preference.security"
-                    end tell
-                end if
-            "#;
-            let _ = std::process::Command::new("osascript")
-                .arg("-e")
-                .arg(script)
-                .output();
-
-            // 权限不足时跳过钩子安装，但继续运行展示托盘图标
-            log::warn!("已跳过鼠标钩子安装（缺少权限），请授权后重启 ScreenHop");
-        } else {
-            // 安装鼠标中键事件钩子
-            if !config.disable_hook {
-                app::install_hook(&config)?;
-            }
-        }
-
-        // 启动系统托盘 + NSApp 事件循环（阻塞）
         tray::run_app(config)?;
+        macos_runtime::shutdown();
     }
 
     // Windows: 安装钩子 + 启动托盘 + 消息循环
@@ -106,10 +70,22 @@ fn inner_main() -> Result<()> {
 }
 
 fn main() {
+    #[cfg(target_os = "macos")]
+    if macos_permissions::run_relaunch_helper() {
+        return;
+    }
     // 获取系统的临时目录
     let temp_dir = std::env::temp_dir();
-    let run_log_path = temp_dir.join("screenhop_run.log");
-    let err_log_path = temp_dir.join("screenhop_fatal_err.log");
+    let run_log_path = temp_dir.join(if screenhop::is_dev_build() {
+        "screenhop_dev_run.log"
+    } else {
+        "screenhop_run.log"
+    });
+    let err_log_path = temp_dir.join(if screenhop::is_dev_build() {
+        "screenhop_dev_fatal_err.log"
+    } else {
+        "screenhop_fatal_err.log"
+    });
 
     // 初始化日志到文件，方便 Finder 启动时或隐藏执行时调试
     let log_file = std::fs::File::create(&run_log_path).unwrap();
